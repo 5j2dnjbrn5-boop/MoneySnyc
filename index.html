@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#111827">
+  <title>MoneySync — สมุดบันทึกรายรับรายจ่าย</title>
+  
+  <!-- ดึงฟอนต์ Prompt เพื่อความสวยงามและน่าใช้งาน -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Prompt:wght@400;500;600;700&display=swap" rel="stylesheet">
+  
+  <link rel="stylesheet" href="style.css">
+  
+  <!-- ไลบรารีสำหรับแปลงการ์ดสรุปเป็นรูปภาพ PNG -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+</head>
+<body>
+<main class="app">
+  <header class="topbar">
+    <div>
+      <div class="eyebrow">MONEY SYNC</div>
+      <h1>บันทึก รายรับ–รายจ่าย</h1>
+      <p class="muted">ข้อมูลเก็บอย่างปลอดภัยในเครื่องของคุณ</p>
+    </div>
+    <button id="themeBtn" class="icon-btn" aria-label="เปลี่ยนธีม">☾ เปลี่ยนเป็นธีมมืด</button>
+  </header>
+
+  <!-- ส่วนการ์ดสรุปย่อที่ใช้แชร์เป็นรูปภาพได้ -->
+  <div id="summaryCardContainer" class="summary-card-container">
+    <section class="cards">
+      <div class="card balance"><span>ยอดคงเหลือทั้งหมด</span><strong id="balance">฿0.00</strong></div>
+      <div class="card income"><span>รายรับเดือนนี้</span><strong id="income">฿0.00</strong></div>
+      <div class="card expense"><span>รายจ่ายเดือนนี้</span><strong id="expense">฿0.00</strong></div>
+    </section>
+  </div>
+
+  <section class="grid">
+    <div class="panel">
+      <div class="panel-head"><h2>➕ บันทึกรายการใหม่</h2></div>
+      <form id="form">
+        <div class="type-switch">
+          <label><input type="radio" name="type" value="expense" checked><span>🔴 รายจ่าย</span></label>
+          <label><input type="radio" name="type" value="income"><span>🟢 รายรับ</span></label>
+        </div>
+        <label>จำนวนเงิน (บาท)<input id="amount" type="number" min=".01" step=".01" placeholder="เช่น 100" required></label>
+        <label>ชื่อรายการ<input id="title" maxlength="80" placeholder="เช่น ค่าอาหาร, เงินเดือน" required></label>
+        <label>หมวดหมู่<select id="category"></select></label>
+        <label>วันที่ทำรายการ<input id="date" type="date" required></label>
+        <label>รายละเอียดเพิ่มเติม (ไม่จำเป็น)<input id="note" maxlength="120" placeholder="ระบุเพิ่มเติม..."></label>
+        <button class="primary" type="submit">💾 บันทึกรายการ</button>
+      </form>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><h2>📊 สรุปใช้จ่ายเดือนนี้</h2></div>
+      <div class="chart-wrap"><canvas id="chart"></canvas></div>
+      <div id="categories" class="category-list"></div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head transactions-head" style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+      <div>
+        <h2>📝 รายการทั้งหมด</h2>
+      </div>
+      <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+        <select id="categoryFilter" class="search">
+          <option value="all">แสดงทุกหมวดหมู่</option>
+        </select>
+        <input id="search" class="search" placeholder="🔍 ค้นหารายการ...">
+      </div>
+    </div>
+    <div id="transactions"></div>
+  </section>
+
+  <section class="panel analysis-panel">
+    <div class="panel-head" style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
+      <h2>📈 สถิติการใช้จ่าย</h2>
+      <button id="toggleAnalysisBtn" class="secondary">📊 ดูการวิเคราะห์ใช้จ่าย</button>
+    </div>
+    <div id="monthlyAnalysis" class="analysis-content hidden" style="margin-top: 12px;">
+    </div>
+  </section>
+
+  <section class="panel share-panel">
+    <div class="panel-head"><div><h2>🖼️ ส่งออก & แชร์ข้อมูล</h2><p class="muted">บันทึกเป็นรูปภาพเพื่อส่งต่อทาง Line หรือโซเชียล</p></div></div>
+    
+    <div class="share-actions-group" style="display: flex; flex-direction: column; gap: 10px;">
+      <button id="exportImgBtn" class="primary" style="background: #10b981;">📸 บันทึกสรุปเป็นรูปภาพ (PNG)</button>
+    </div>
+
+    <div style="margin-top: 16px; border-top: 1px dashed var(--line); padding-top: 12px;">
+      <details>
+        <summary style="cursor: pointer; font-size: 14px; color: var(--muted); font-weight: 500;">🔗 สร้างลิงก์ส่งออกข้อมูลแบบดั้งเดิม (Snapshot)</summary>
+        <div class="share-options" style="margin-top: 10px;">
+          <label>ช่วงเวลาข้อมูล<select id="shareRange">
+            <option value="all">ข้อมูลทั้งหมด</option>
+            <option value="month" selected>เฉพาะเดือนนี้</option>
+          </select></label>
+          <label>แนบรายละเอียด<select id="shareNotes"><option value="no">ไม่แนบ</option><option value="yes" selected>แนบไปด้วย</option></select></label>
+        </div>
+        <button id="shareBtn" class="secondary" style="margin-top: 8px;">🔗 สร้างลิงก์แชร์</button>
+        <div id="shareResult" class="share-result hidden">
+          <p><strong>สร้างลิงก์เรียบร้อยแล้ว ✓</strong></p>
+          <textarea id="shareUrl" readonly></textarea>
+          <div class="share-actions"><button id="copyBtn">📋 คัดลอกลิงก์</button><button id="openShareBtn">👁️ เปิดดูหน้าเว็บ</button></div>
+        </div>
+      </details>
+    </div>
+  </section>
+
+  <footer>MoneySync • สมุดบันทึกรายรับรายจ่ายส่วนบุคคล</footer>
+</main>
+
+<div id="toast" class="toast"></div>
+<script src="app.js"></script>
+</body>
+</html>
