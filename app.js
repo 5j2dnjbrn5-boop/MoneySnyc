@@ -23,9 +23,8 @@ const firebaseConfig = {
   messagingSenderId: "350758125149",
   appId: "1:350758125149:web:539d4d90beb3e88c3497b4",
   measurementId: "G-BEKN1FH9GD",
-  databaseURL: "https://exam-planer-pro-default-rtdb.firebaseio.com"
+  databaseURL: "https://exam-planer-pro-default-rtdb.asia-southeast1.firebasedatabase.app" 
 };
-
 let db = null;
 try {
   if (typeof firebase !== "undefined") {
