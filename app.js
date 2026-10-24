@@ -30,7 +30,7 @@ let auth = null;
 try {
   if (typeof firebase !== "undefined") {
     firebase.initializeApp(firebaseConfig);
-    db = firebase.database();
+    db = firebase.firestore();
     auth = firebase.auth();
   }
 } catch (e) {
@@ -43,6 +43,8 @@ let currentCalDate = new Date(new Date().getFullYear(), new Date().getMonth(), 1
 let syncDebounceTimer = null;
 let toastTimer = null;
 let cloudReady = false;
+let unsubscribeCloud = null;
+const OWNER_KEY = "moneysync_owner";
 
 const $ = id => document.getElementById(id);
 const money = n => new Intl.NumberFormat("th-TH", { style: "currency", currency: "THB" }).format(Number(n) || 0);
@@ -123,8 +125,45 @@ function setSyncStatus(text) {
 }
 function authLabel() {
   const u = auth && auth.currentUser;
-  if (!u) return "ยังไม่ได้ยืนยันตัวตน";
-  return u.isAnonymous ? "ผู้ใช้ไม่ระบุตัวตน — ล็อกอิน Google เพื่อใช้ข้ามเครื่อง" : (u.email || "ล็อกอินแล้ว");
+  return u ? (u.email || u.displayName || "ล็อกอินแล้ว") : "ยังไม่ได้ล็อกอิน";
+}
+function cloudDoc() {
+  const u = auth && auth.currentUser;
+  return db && u ? db.collection("users").doc(u.uid) : null;   // 1 บัญชี Google = 1 เอกสาร
+}
+function readCloud(snap) {
+  if (!snap || !snap.exists) return null;
+  try { return normalizeStore(JSON.parse(snap.data().json)); } catch (e) { return null; }
+}
+function updateAccountUI() {
+  const u = auth && auth.currentUser;
+  const info = $("accountInfo");
+  if (info) info.textContent = u ? `บัญชีที่ใช้ซิงค์: ${authLabel()}` : "ยังไม่ได้ล็อกอิน — ข้อมูลเก็บเฉพาะในเครื่องนี้";
+  const li = $("googleLoginBtn"), lo = $("logoutBtn");
+  if (li) li.classList.toggle("hidden", !!u);
+  if (lo) lo.classList.toggle("hidden", !u);
+}
+function mergeNewest(a, b) {
+  const by = (x, y) => {
+    const m = new Map(x.map(i => [i.id, i]));
+    y.forEach(i => { const o = m.get(i.id); if (!o || (i.updatedAt || 0) > (o.updatedAt || 0)) m.set(i.id, i); });
+    return [...m.values()];
+  };
+  return { ...a, updatedAt: Date.now(), wallets: by(a.wallets, b.wallets), transactions: by(a.transactions, b.transactions),
+    budgets: by(a.budgets, b.budgets), goals: by(a.goals, b.goals), recurring: by(a.recurring, b.recurring) };
+}
+function stopListening() { if (unsubscribeCloud) { unsubscribeCloud(); unsubscribeCloud = null; } }
+function startListening(ref) {
+  stopListening();
+  unsubscribeCloud = ref.onSnapshot(snap => {
+    if (snap.metadata.hasPendingWrites || !cloudReady) return;
+    const cloud = readCloud(snap);
+    if (cloud && cloud.updatedAt > (store.updatedAt || 0)) {
+      applyCloudStore(cloud);
+      setSyncStatus(`🟢 ซิงค์เรียบร้อย (${authLabel()})`);
+      showToast("อัปเดตข้อมูลจากอุปกรณ์อื่นแล้ว ✓");
+    }
+  }, err => console.warn("Listen error:", err));
 }
 
 // ==================== DATA MIGRATION & STORAGE ====================
@@ -195,17 +234,17 @@ function syncToCloud() {
 }
 
 function pushStore() {
-  const uid = auth && auth.currentUser ? auth.currentUser.uid : null;
-  if (!db || !uid) {
-    setSyncStatus("🔴 ออฟไลน์ (บันทึกเฉพาะในเครื่อง)");
+  const ref = cloudDoc();
+  if (!ref) {
+    setSyncStatus("🟡 ใช้ข้อมูลในเครื่อง (ล็อกอิน Google เพื่อซิงค์ข้ามเครื่อง)");
     return Promise.resolve();
   }
   setSyncStatus("🔄 กำลังส่งข้อมูลไปยัง Firebase...");
-  return db.ref(`users/${uid}/store`).set(JSON.parse(JSON.stringify(store)))
+  return ref.set({ json: JSON.stringify(store), updatedAt: store.updatedAt || 0, email: auth.currentUser.email || "" })
     .then(() => setSyncStatus(`🟢 ซิงค์เรียบร้อย (${authLabel()})`))
     .catch(err => {
       console.warn("Cloud Sync Error:", err);
-      setSyncStatus(`🔴 ซิงค์ไม่สำเร็จ (${err.message})`);
+      setSyncStatus(`🔴 ซิงค์ไม่สำเร็จ (${err.code || err.message})`);
     });
 }
 
@@ -216,74 +255,87 @@ function applyCloudStore(cloud) {
 }
 
 // เปิดแอป: ล็อกอินแบบไม่ระบุตัวตน -> เทียบเวลา -> ใช้ข้อมูลที่ใหม่กว่า (ไม่เขียนทับมั่ว)
+// ทำงานเมื่อล็อกอิน/เปิดแอป: ข้อมูลผูกกับบัญชี Google (uid) ไม่ปนกันระหว่างบัญชี
 async function initialSync() {
-  if (!db || !auth) { cloudReady = true; setSyncStatus("🔴 ออฟไลน์ (บันทึกเฉพาะในเครื่อง)"); return; }
+  const ref = cloudDoc();
+  if (!ref) {
+    cloudReady = false;
+    stopListening();
+    setSyncStatus("🟡 ใช้ข้อมูลในเครื่อง (ล็อกอิน Google เพื่อซิงค์ข้ามเครื่อง)");
+    return;
+  }
   try {
     setSyncStatus("🔄 กำลังตรวจสอบข้อมูลบน Cloud...");
-    if (!auth.currentUser) await auth.signInAnonymously();
-    const snap = await db.ref(`users/${auth.currentUser.uid}/store`).once("value");
-    const raw = snap.val();
-    const cloud = raw ? normalizeStore(raw) : null;
-    const localTime = store.updatedAt || 0;
+    const uid = auth.currentUser.uid;
+    const cloud = readCloud(await ref.get());
+    const owner = localStorage.getItem(OWNER_KEY);
+    if (owner && owner !== uid) { store = normalizeStore({}); }   // ข้อมูลในเครื่องเป็นของบัญชีอื่น: ไม่เอามาปนกัน
+    const hasLocal = store.transactions.length || store.budgets.length || store.goals.length || store.recurring.length;
 
     if (!cloud) {
-      cloudReady = true;
-      await pushStore();
-    } else if (cloud.updatedAt > localTime) {
-      if (store.transactions.length === 0 || confirm("พบข้อมูลบน Cloud ที่ใหม่กว่าในเครื่อง ต้องการใช้ข้อมูลจาก Cloud หรือไม่?")) {
-        applyCloudStore(cloud);
-        showToast("ดึงข้อมูลล่าสุดจาก Cloud แล้ว ✓");
-        setSyncStatus(`🟢 ซิงค์เรียบร้อย (${authLabel()})`);
-      } else {
-        cloudReady = true;
-        await pushStore();
-      }
-    } else if (cloud.updatedAt < localTime) {
-      cloudReady = true;
-      await pushStore();
+      // บัญชีนี้ยังไม่มีข้อมูลบน Cloud -> อัปโหลดข้อมูลในเครื่อง
+    } else if (owner === uid) {
+      if (cloud.updatedAt > (store.updatedAt || 0)) store = cloud;
+    } else if (hasLocal) {
+      store = mergeNewest(cloud, store);       // ล็อกอินครั้งแรกบนเครื่องที่มีข้อมูลอยู่แล้ว: รวมตาม id
     } else {
-      setSyncStatus(`🟢 ซิงค์เรียบร้อย (${authLabel()})`);
+      store = cloud;
     }
+    localStorage.setItem(OWNER_KEY, uid);
+    localStorage.setItem(KEY_V2, JSON.stringify(store));
+    renderAll();
     cloudReady = true;
+    await pushStore();
+    startListening(ref);
   } catch (err) {
     console.warn("Initial sync error:", err);
-    setSyncStatus(`🔴 เชื่อมต่อ Cloud ไม่ได้ (${err.message})`);
+    setSyncStatus(`🔴 เชื่อมต่อ Cloud ไม่ได้ (${err.code || err.message})`);
   }
 }
 
 async function googleLogin() {
   if (!auth) { alert("ยังเชื่อมต่อ Firebase ไม่ได้"); return; }
   const provider = new firebase.auth.GoogleAuthProvider();
+  provider.setCustomParameters({ prompt: "select_account" });
   try {
-    if (auth.currentUser && auth.currentUser.isAnonymous) {
-      try {
-        await auth.currentUser.linkWithPopup(provider);
-      } catch (e) {
-        if (e.code === "auth/credential-already-in-use" && e.credential) await auth.signInWithCredential(e.credential);
-        else throw e;
-      }
-    } else {
-      await auth.signInWithPopup(provider);
-    }
-    cloudReady = false;
-    await initialSync();
+    await auth.signInWithPopup(provider);          // สำเร็จแล้ว onAuthStateChanged จะเรียก initialSync เอง
   } catch (err) {
-    alert("ล็อกอินไม่สำเร็จ: " + err.message);
+    if (err.code === "auth/popup-blocked" || err.code === "auth/operation-not-supported-in-this-environment") {
+      return auth.signInWithRedirect(provider);
+    }
+    if (err.code === "auth/popup-closed-by-user" || err.code === "auth/cancelled-popup-request") return;
+    alert("ล็อกอินไม่สำเร็จ: " + (err.code || err.message) +
+      (err.code === "auth/unauthorized-domain" ? "\nต้องเพิ่มโดเมนนี้ใน Firebase → Authentication → Settings → Authorized domains" : ""));
   }
 }
 
-function pullFromCloud() {
-  const uid = auth && auth.currentUser ? auth.currentUser.uid : null;
-  if (!db || !uid) { alert("ยังเชื่อมต่อ Firebase ไม่ได้ในขณะนี้"); return; }
-  db.ref(`users/${uid}/store`).once("value")
-    .then(snapshot => {
-      const raw = snapshot.val();
-      if (!raw) { alert("ยังไม่มีข้อมูลบน Cloud"); return; }
-      if (!confirm("พบข้อมูลบน Cloud ต้องการนำมาทับข้อมูลในเครื่องใช่หรือไม่?")) return;
-      applyCloudStore(normalizeStore(raw));
-      showToast("ดึงข้อมูลจาก Cloud สำเร็จ ✓");
-    })
-    .catch(err => alert("ดึงข้อมูลไม่สำเร็จ: " + err.message));
+async function logout() {
+  if (!auth || !auth.currentUser) return;
+  if (!confirm("ออกจากระบบ? ข้อมูลในเครื่องนี้จะถูกล้าง (ข้อมูลยังอยู่บน Cloud ของบัญชีนี้)")) return;
+  try { if (cloudReady) await pushStore(); } catch (e) {}
+  stopListening();
+  cloudReady = false;
+  await auth.signOut();
+  store = normalizeStore({});
+  localStorage.setItem(KEY_V2, JSON.stringify(store));
+  localStorage.removeItem(OWNER_KEY);
+  renderAll();
+  updateAccountUI();
+  setSyncStatus("🟡 ออกจากระบบแล้ว (ใช้ข้อมูลในเครื่อง)");
+}
+
+async function pullFromCloud() {
+  const ref = cloudDoc();
+  if (!ref) { alert("ต้องล็อกอินด้วย Google ก่อน"); return; }
+  try {
+    const cloud = readCloud(await ref.get());
+    if (!cloud) { alert("ยังไม่มีข้อมูลบน Cloud"); return; }
+    if (!confirm("นำข้อมูลจาก Cloud มาทับข้อมูลในเครื่องใช่หรือไม่?")) return;
+    applyCloudStore(cloud);
+    showToast("ดึงข้อมูลจาก Cloud สำเร็จ ✓");
+  } catch (err) {
+    alert("ดึงข้อมูลไม่สำเร็จ: " + (err.code || err.message));
+  }
 }
 
 // ==================== RECURRING ENGINE ====================
@@ -971,6 +1023,7 @@ document.addEventListener("DOMContentLoaded", () => {
   });
   $("pullCloudBtn").addEventListener("click", () => pullFromCloud());
   $("googleLoginBtn").addEventListener("click", googleLogin);
+  $("logoutBtn").addEventListener("click", logout);
   $("recType").addEventListener("change", updateDropdowns);
 
   // ปุ่มในรายการ (แทน onclick inline)
@@ -1047,5 +1100,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
   if (processRecurring()) saveStore();
   renderAll();
-  initialSync();
+  updateAccountUI();
+  if (auth) auth.onAuthStateChanged(() => { updateAccountUI(); initialSync(); });
+  else setSyncStatus("🔴 ออฟไลน์ (โหลด Firebase ไม่สำเร็จ)");
 });
