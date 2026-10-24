@@ -199,14 +199,27 @@
           <label>ปี<select id="shopYear"></select></label>
           <label>เดือน<select id="shopMonth"></select></label>
         </div>
-        <p class="muted-sm" style="margin: 0 0 12px;">ดึงอัตโนมัติ: <b>ยอดขาย</b> จากรายรับหมวด "ขายของ" · <b>ต้นทุน</b> จากรายจ่ายหมวด "ซื้อสต็อกสินค้า" · <b>ค่าขนส่ง</b> จากหมวด "ค่าขนส่ง/แพ็กของ"</p>
+        <p class="muted-sm" style="margin: 0 0 12px;">ระบบนับให้อัตโนมัติจาก <b>หมวดหมู่</b> หรือ <b>คำในชื่อรายการ</b> เช่น "ลงของ" = ต้นทุนสินค้า, "จัดร้าน/ค่าล็อค" = ค่าตั้งร้าน, "ขาย..." = ยอดขาย (แก้คำได้ที่ด้านล่าง)</p>
         <div id="shopKpis" class="kpi-grid"></div>
         <div id="shopInsight" class="insights-box"></div>
       </div>
       <div class="panel"><div class="panel-head"><h2>📊 ยอดขาย vs ซื้อสต็อก รายเดือน</h2></div><div id="shopChart"></div></div>
       <div class="panel"><div class="panel-head"><h2>🏆 รายการขายดี</h2></div><div id="shopTopSales"></div></div>
       <div class="panel"><div class="panel-head"><h2>📦 ซื้อสต็อกมากสุด</h2></div><div id="shopTopStock"></div></div>
+      <div class="panel"><div class="panel-head"><h2>🧾 ค่าตั้งร้าน/ค่าขนส่ง ตามรายการ</h2></div><div id="shopTopOther"></div></div>
       <div class="panel"><div class="panel-head"><h2>📅 วันไหนขายดี</h2></div><div id="shopWeekday"></div></div>
+
+      <details class="panel" id="rulesBox">
+        <summary><b>🔎 คำที่ใช้จับรายการ (แก้ได้)</b></summary>
+        <p class="muted-sm">ถ้าชื่อรายการมีคำเหล่านี้ ระบบจะนับเข้ากลุ่มนั้นให้ แม้เลือกหมวดหมู่อื่นไว้ — คั่นแต่ละคำด้วยเครื่องหมายคอมมา (,)</p>
+        <div class="rules-form">
+          <label>ยอดขาย (รายรับ)<input id="ruleSales"></label>
+          <label>ต้นทุนสินค้า / ลงของ (รายจ่าย)<input id="ruleStock"></label>
+          <label>ค่าตั้งร้าน / ค่าล็อค (รายจ่าย)<input id="ruleSetup"></label>
+          <label>ค่าขนส่ง / แพ็กของ (รายจ่าย)<input id="ruleShip"></label>
+          <div class="backup-actions"><button type="button" id="rulesSaveBtn" class="primary">💾 บันทึกคำค้นหา</button><button type="button" id="rulesResetBtn" class="secondary">↺ คืนค่าเริ่มต้น</button></div>
+        </div>
+      </details>
 
       <div class="panel">
         <div class="panel-head"><h2>🤝 ลูกหนี้ / เจ้าหนี้</h2></div>
