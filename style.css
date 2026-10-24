@@ -373,3 +373,35 @@ body { padding-bottom: calc(90px + env(safe-area-inset-bottom, 0px)); }
 .dn-dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
 .dn-name { flex: 1; font-weight: 600; }
 .dn-val { color: var(--muted); font-size: 13px; white-space: nowrap; }
+
+/* Shop */
+.badge-low { background: var(--red); color: #fff; font-size: 11px; border-radius: 6px; padding: 1px 6px; margin-left: 6px; font-weight: 600; }
+.low-alert { border-color: var(--red); font-size: 14px; }
+.bottom-nav .nav-item:not(.add-tab-btn) { flex: 1; min-width: 0; }
+.bottom-nav .add-tab-btn { flex: none; margin-left: 6px; margin-right: 6px; }
+
+/* Shop analysis */
+.kpi-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-bottom: 12px; }
+.kpi-delta { display: block; font-size: 12px; margin-top: 2px; }
+.rank-row { display: grid; gap: 4px; margin-bottom: 10px; }
+.rank-head { display: flex; justify-content: space-between; gap: 8px; font-size: 14px; }
+.rank-bar { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; }
+.rank-bar > i { display: block; height: 100%; background: var(--accent); }
+.rank-bar.stock > i { background: #f59e0b; }
+#shopChart svg { display: block; width: 100%; height: auto; }
+.sh-axis { fill: var(--muted); font-size: 10px; }
+.chart-legend { display: flex; gap: 14px; justify-content: center; font-size: 12px; color: var(--muted); margin-top: 6px; }
+.chart-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; }
+.low-alert, .badge-low { display: none; }
+
+/* Segmented control + shop polish */
+.seg { display: flex; gap: 4px; background: var(--panel); border: 1.5px solid var(--panel-border); padding: 4px; border-radius: 14px; margin-bottom: 14px; }
+.seg button { flex: 1; border: 0; background: transparent; color: var(--muted); font-weight: 600; min-height: 42px; border-radius: 10px; }
+.seg button.active-sub { background: var(--accent); color: #fff; box-shadow: 0 2px 8px rgba(79, 70, 229, 0.35); }
+.kpi-hero { grid-column: 1 / -1; border-radius: 16px; padding: 18px; color: #fff; background: linear-gradient(135deg, #4f46e5, #7c3aed); }
+.kpi-hero.neg { background: linear-gradient(135deg, #dc2626, #f97316); }
+.kpi-hero span { display: block; font-size: 13px; opacity: .85; }
+.kpi-hero strong { display: block; font-size: 30px; font-weight: 700; margin: 2px 0; }
+.kpi-hero .kpi-delta { color: #fff; opacity: .9; }
+.card strong.inc { color: var(--green); }
+.card strong.exp { color: var(--red); }
