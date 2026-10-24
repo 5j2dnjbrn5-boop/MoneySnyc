@@ -15,7 +15,7 @@
   <!-- Firebase SDK Compat -->
   <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-auth-compat.js"></script>
-  <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-database-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore-compat.js"></script>
 </head>
 <body>
 <div class="app-layout">
@@ -197,11 +197,13 @@
         <div class="sync-status-box">
           <div id="syncStatusText">สถานะ: 🟡 ใช้ข้อมูลในเครื่อง (Offline Mode)</div>
           <small class="muted-sm">บันทึกลงเครื่องทันที และจะ Auto-Sync ไปยัง Firebase Cloud เมื่อมีการเปลี่ยนแปลงข้อมูล</small>
+          <div id="accountInfo" class="muted-sm"></div>
         </div>
         <div style="margin-top: 12px; display: flex; gap: 8px; flex-wrap: wrap;">
           <button id="syncNowBtn" class="primary" style="flex:1;">🔄 ซิงค์ข้อมูลเดี๋ยวนี้</button>
           <button id="pullCloudBtn" class="secondary" style="flex:1;">📥 ดึงข้อมูลล่าสุดจาก Cloud</button>
           <button id="googleLoginBtn" class="secondary" style="flex-basis:100%;">🔐 ล็อกอินด้วย Google (ซิงค์ข้ามเครื่อง)</button>
+          <button id="logoutBtn" class="secondary hidden" style="flex-basis:100%;">🚪 ออกจากระบบ</button>
         </div>
       </div>
 
