@@ -6,7 +6,8 @@ const CATEGORIES = {
   expense: [
     '🍚 อาหาร', '🚗 เดินทาง', '🛒 ของใช้', 
     '🎬 ความบันเทิง', '📚 การเรียน', '💳 บิล/อินเทอร์เน็ต', 
-    '🛍️ ช้อปปิ้ง', '🏥 สุขภาพ/ยา','📦stockสินค้า', '🎁 อื่น ๆ'
+    '🛍️ ช้อปปิ้ง', '🏥 สุขภาพ/ยา',
+    '📦 ซื้อสต็อกสินค้า', '🚚 ค่าขนส่ง/แพ็กของ', '🎁 อื่น ๆ'
   ],
   income: [
     '💼 เงินเดือน', '📈 ดอกเบี้ย / ปันผล / ลงทุน', 
@@ -30,7 +31,7 @@ let auth = null;
 try {
   if (typeof firebase !== "undefined") {
     firebase.initializeApp(firebaseConfig);
-    db = firebase.database();
+    db = firebase.firestore();
     auth = firebase.auth();
   }
 } catch (e) {
@@ -38,11 +39,14 @@ try {
 }
 
 let store = loadStore();
+store.products ||= []; store.debts ||= [];
 let deletedTxBackup = null;
 let currentCalDate = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
 let syncDebounceTimer = null;
 let toastTimer = null;
 let cloudReady = false;
+let unsubscribeCloud = null;
+const OWNER_KEY = "moneysync_owner";
 
 const $ = id => document.getElementById(id);
 const money = n => new Intl.NumberFormat("th-TH", { style: "currency", currency: "THB" }).format(Number(n) || 0);
@@ -107,13 +111,20 @@ function normalizeStore(s) {
       walletId: sid(r.walletId) || "w_bank",
       dayOfMonth: Math.min(31, Math.max(1, Number(r.dayOfMonth) || 1)),
       lastGeneratedMonth: String(r.lastGeneratedMonth || "") }));
+  out.products = arr(s.products).filter(p => p && sid(p.id) && String(p.name || "").trim())
+    .map(p => ({ id: sid(p.id), name: String(p.name).slice(0, 60), qty: Number(p.qty) || 0, cost: Math.max(0, Number(p.cost) || 0),
+      price: Math.max(0, Number(p.price) || 0), min: Math.max(0, Number(p.min) || 0), updatedAt: Number(p.updatedAt) || Date.now() }));
+  out.debts = arr(s.debts).filter(d => d && sid(d.id) && Number(d.amount) > 0)
+    .map(d => ({ id: sid(d.id), who: String(d.who || "").slice(0, 60), amount: Number(d.amount), kind: d.kind === "payable" ? "payable" : "receivable",
+      due: isDate(d.due) ? String(d.due) : "", note: String(d.note || "").slice(0, 120), paid: !!d.paid, updatedAt: Number(d.updatedAt) || Date.now() }));
   return out;
 }
 
 function mergeStores(a, b) {
   const byId = (x, y) => { const m = new Map(x.map(i => [i.id, i])); y.forEach(i => { if (!m.has(i.id)) m.set(i.id, i); }); return [...m.values()]; };
   return { ...a, wallets: byId(a.wallets, b.wallets), transactions: byId(a.transactions, b.transactions),
-    budgets: byId(a.budgets, b.budgets), goals: byId(a.goals, b.goals), recurring: byId(a.recurring, b.recurring) };
+    budgets: byId(a.budgets, b.budgets), goals: byId(a.goals, b.goals), recurring: byId(a.recurring, b.recurring),
+    products: byId(a.products || [], b.products || []), debts: byId(a.debts || [], b.debts || []) };
 }
 
 // ==================== USER ID MANAGEMENT ====================
@@ -121,10 +132,53 @@ function setSyncStatus(text) {
   const el = $("syncStatusText");
   if (el) el.textContent = "สถานะ: " + text;
 }
+function cloudErr(err) {
+  if (err && err.code === "permission-denied") return "Firestore Rules ไม่อนุญาต — ตรวจสอบ/Publish Rules ของ Cloud Firestore";
+  if (err && err.code === "unavailable") return "ติดต่อ Firestore ไม่ได้ (ออฟไลน์?)";
+  return (err && (err.code || err.message)) || "unknown";
+}
 function authLabel() {
   const u = auth && auth.currentUser;
-  if (!u) return "ยังไม่ได้ยืนยันตัวตน";
-  return u.isAnonymous ? "ผู้ใช้ไม่ระบุตัวตน — ล็อกอิน Google เพื่อใช้ข้ามเครื่อง" : (u.email || "ล็อกอินแล้ว");
+  return u ? (u.email || u.displayName || "ล็อกอินแล้ว") : "ยังไม่ได้ล็อกอิน";
+}
+function cloudDoc() {
+  const u = auth && auth.currentUser;
+  return db && u ? db.collection("moneysync_users").doc(u.uid) : null;   // 1 บัญชี Google = 1 เอกสาร
+}
+function readCloud(snap) {
+  if (!snap || !snap.exists) return null;
+  try { return normalizeStore(JSON.parse(snap.data().json)); } catch (e) { return null; }
+}
+function updateAccountUI() {
+  const u = auth && auth.currentUser;
+  const info = $("accountInfo");
+  if (info) info.textContent = u ? `บัญชีที่ใช้ซิงค์: ${authLabel()}` : "ยังไม่ได้ล็อกอิน — ข้อมูลเก็บเฉพาะในเครื่องนี้";
+  const li = $("googleLoginBtn"), lo = $("logoutBtn");
+  if (li) li.classList.toggle("hidden", !!u);
+  if (lo) lo.classList.toggle("hidden", !u);
+}
+function mergeNewest(a, b) {
+  const by = (x, y) => {
+    const m = new Map(x.map(i => [i.id, i]));
+    y.forEach(i => { const o = m.get(i.id); if (!o || (i.updatedAt || 0) > (o.updatedAt || 0)) m.set(i.id, i); });
+    return [...m.values()];
+  };
+  return { ...a, updatedAt: Date.now(), wallets: by(a.wallets, b.wallets), transactions: by(a.transactions, b.transactions),
+    budgets: by(a.budgets, b.budgets), goals: by(a.goals, b.goals), recurring: by(a.recurring, b.recurring),
+    products: by(a.products || [], b.products || []), debts: by(a.debts || [], b.debts || []) };
+}
+function stopListening() { if (unsubscribeCloud) { unsubscribeCloud(); unsubscribeCloud = null; } }
+function startListening(ref) {
+  stopListening();
+  unsubscribeCloud = ref.onSnapshot(snap => {
+    if (snap.metadata.hasPendingWrites || !cloudReady) return;
+    const cloud = readCloud(snap);
+    if (cloud && cloud.updatedAt > (store.updatedAt || 0)) {
+      applyCloudStore(cloud);
+      setSyncStatus(`🟢 ซิงค์เรียบร้อย (${authLabel()})`);
+      showToast("อัปเดตข้อมูลจากอุปกรณ์อื่นแล้ว ✓");
+    }
+  }, err => console.warn("Listen error:", err));
 }
 
 // ==================== DATA MIGRATION & STORAGE ====================
@@ -195,17 +249,17 @@ function syncToCloud() {
 }
 
 function pushStore() {
-  const uid = auth && auth.currentUser ? auth.currentUser.uid : null;
-  if (!db || !uid) {
-    setSyncStatus("🔴 ออฟไลน์ (บันทึกเฉพาะในเครื่อง)");
+  const ref = cloudDoc();
+  if (!ref) {
+    setSyncStatus("🟡 ใช้ข้อมูลในเครื่อง (ล็อกอิน Google เพื่อซิงค์ข้ามเครื่อง)");
     return Promise.resolve();
   }
   setSyncStatus("🔄 กำลังส่งข้อมูลไปยัง Firebase...");
-  return db.ref(`users/${uid}/store`).set(JSON.parse(JSON.stringify(store)))
+  return ref.set({ json: JSON.stringify(store), updatedAt: store.updatedAt || 0, email: auth.currentUser.email || "" })
     .then(() => setSyncStatus(`🟢 ซิงค์เรียบร้อย (${authLabel()})`))
     .catch(err => {
       console.warn("Cloud Sync Error:", err);
-      setSyncStatus(`🔴 ซิงค์ไม่สำเร็จ (${err.message})`);
+      setSyncStatus(`🔴 ซิงค์ไม่สำเร็จ: ${cloudErr(err)}`);
     });
 }
 
@@ -216,74 +270,87 @@ function applyCloudStore(cloud) {
 }
 
 // เปิดแอป: ล็อกอินแบบไม่ระบุตัวตน -> เทียบเวลา -> ใช้ข้อมูลที่ใหม่กว่า (ไม่เขียนทับมั่ว)
+// ทำงานเมื่อล็อกอิน/เปิดแอป: ข้อมูลผูกกับบัญชี Google (uid) ไม่ปนกันระหว่างบัญชี
 async function initialSync() {
-  if (!db || !auth) { cloudReady = true; setSyncStatus("🔴 ออฟไลน์ (บันทึกเฉพาะในเครื่อง)"); return; }
+  const ref = cloudDoc();
+  if (!ref) {
+    cloudReady = false;
+    stopListening();
+    setSyncStatus("🟡 ใช้ข้อมูลในเครื่อง (ล็อกอิน Google เพื่อซิงค์ข้ามเครื่อง)");
+    return;
+  }
   try {
     setSyncStatus("🔄 กำลังตรวจสอบข้อมูลบน Cloud...");
-    if (!auth.currentUser) await auth.signInAnonymously();
-    const snap = await db.ref(`users/${auth.currentUser.uid}/store`).once("value");
-    const raw = snap.val();
-    const cloud = raw ? normalizeStore(raw) : null;
-    const localTime = store.updatedAt || 0;
+    const uid = auth.currentUser.uid;
+    const cloud = readCloud(await ref.get());
+    const owner = localStorage.getItem(OWNER_KEY);
+    if (owner && owner !== uid) { store = normalizeStore({}); }   // ข้อมูลในเครื่องเป็นของบัญชีอื่น: ไม่เอามาปนกัน
+    const hasLocal = store.transactions.length || store.budgets.length || store.goals.length || store.recurring.length;
 
     if (!cloud) {
-      cloudReady = true;
-      await pushStore();
-    } else if (cloud.updatedAt > localTime) {
-      if (store.transactions.length === 0 || confirm("พบข้อมูลบน Cloud ที่ใหม่กว่าในเครื่อง ต้องการใช้ข้อมูลจาก Cloud หรือไม่?")) {
-        applyCloudStore(cloud);
-        showToast("ดึงข้อมูลล่าสุดจาก Cloud แล้ว ✓");
-        setSyncStatus(`🟢 ซิงค์เรียบร้อย (${authLabel()})`);
-      } else {
-        cloudReady = true;
-        await pushStore();
-      }
-    } else if (cloud.updatedAt < localTime) {
-      cloudReady = true;
-      await pushStore();
+      // บัญชีนี้ยังไม่มีข้อมูลบน Cloud -> อัปโหลดข้อมูลในเครื่อง
+    } else if (owner === uid) {
+      if (cloud.updatedAt > (store.updatedAt || 0)) store = cloud;
+    } else if (hasLocal) {
+      store = mergeNewest(cloud, store);       // ล็อกอินครั้งแรกบนเครื่องที่มีข้อมูลอยู่แล้ว: รวมตาม id
     } else {
-      setSyncStatus(`🟢 ซิงค์เรียบร้อย (${authLabel()})`);
+      store = cloud;
     }
+    localStorage.setItem(OWNER_KEY, uid);
+    localStorage.setItem(KEY_V2, JSON.stringify(store));
+    renderAll();
     cloudReady = true;
+    await pushStore();
+    startListening(ref);
   } catch (err) {
     console.warn("Initial sync error:", err);
-    setSyncStatus(`🔴 เชื่อมต่อ Cloud ไม่ได้ (${err.message})`);
+    setSyncStatus(`🔴 เชื่อมต่อ Cloud ไม่ได้: ${cloudErr(err)}`);
   }
 }
 
 async function googleLogin() {
   if (!auth) { alert("ยังเชื่อมต่อ Firebase ไม่ได้"); return; }
   const provider = new firebase.auth.GoogleAuthProvider();
+  provider.setCustomParameters({ prompt: "select_account" });
   try {
-    if (auth.currentUser && auth.currentUser.isAnonymous) {
-      try {
-        await auth.currentUser.linkWithPopup(provider);
-      } catch (e) {
-        if (e.code === "auth/credential-already-in-use" && e.credential) await auth.signInWithCredential(e.credential);
-        else throw e;
-      }
-    } else {
-      await auth.signInWithPopup(provider);
-    }
-    cloudReady = false;
-    await initialSync();
+    await auth.signInWithPopup(provider);          // สำเร็จแล้ว onAuthStateChanged จะเรียก initialSync เอง
   } catch (err) {
-    alert("ล็อกอินไม่สำเร็จ: " + err.message);
+    if (err.code === "auth/popup-blocked" || err.code === "auth/operation-not-supported-in-this-environment") {
+      return auth.signInWithRedirect(provider);
+    }
+    if (err.code === "auth/popup-closed-by-user" || err.code === "auth/cancelled-popup-request") return;
+    alert("ล็อกอินไม่สำเร็จ: " + (err.code || err.message) +
+      (err.code === "auth/unauthorized-domain" ? "\nต้องเพิ่มโดเมนนี้ใน Firebase → Authentication → Settings → Authorized domains" : ""));
   }
 }
 
-function pullFromCloud() {
-  const uid = auth && auth.currentUser ? auth.currentUser.uid : null;
-  if (!db || !uid) { alert("ยังเชื่อมต่อ Firebase ไม่ได้ในขณะนี้"); return; }
-  db.ref(`users/${uid}/store`).once("value")
-    .then(snapshot => {
-      const raw = snapshot.val();
-      if (!raw) { alert("ยังไม่มีข้อมูลบน Cloud"); return; }
-      if (!confirm("พบข้อมูลบน Cloud ต้องการนำมาทับข้อมูลในเครื่องใช่หรือไม่?")) return;
-      applyCloudStore(normalizeStore(raw));
-      showToast("ดึงข้อมูลจาก Cloud สำเร็จ ✓");
-    })
-    .catch(err => alert("ดึงข้อมูลไม่สำเร็จ: " + err.message));
+async function logout() {
+  if (!auth || !auth.currentUser) return;
+  if (!confirm("ออกจากระบบ? ข้อมูลในเครื่องนี้จะถูกล้าง (ข้อมูลยังอยู่บน Cloud ของบัญชีนี้)")) return;
+  try { if (cloudReady) await pushStore(); } catch (e) {}
+  stopListening();
+  cloudReady = false;
+  await auth.signOut();
+  store = normalizeStore({});
+  localStorage.setItem(KEY_V2, JSON.stringify(store));
+  localStorage.removeItem(OWNER_KEY);
+  renderAll();
+  updateAccountUI();
+  setSyncStatus("🟡 ออกจากระบบแล้ว (ใช้ข้อมูลในเครื่อง)");
+}
+
+async function pullFromCloud() {
+  const ref = cloudDoc();
+  if (!ref) { alert("ต้องล็อกอินด้วย Google ก่อน"); return; }
+  try {
+    const cloud = readCloud(await ref.get());
+    if (!cloud) { alert("ยังไม่มีข้อมูลบน Cloud"); return; }
+    if (!confirm("นำข้อมูลจาก Cloud มาทับข้อมูลในเครื่องใช่หรือไม่?")) return;
+    applyCloudStore(cloud);
+    showToast("ดึงข้อมูลจาก Cloud สำเร็จ ✓");
+  } catch (err) {
+    alert("ดึงข้อมูลไม่สำเร็จ: " + (err.code || err.message));
+  }
 }
 
 // ==================== RECURRING ENGINE ====================
@@ -381,12 +448,149 @@ function switchTab(tabId) {
     dashboard: "🏠 หน้าหลัก",
     add: "➕ บันทึกรายการ",
     history: "📚 ประวัติการเงิน",
-    analytics: "📊 วิเคราะห์รายปี",
+    analytics: "📊 วิเคราะห์",
     settings: "⚙️ ตั้งค่าระบบ"
   };
   if ($("pageTitle")) $("pageTitle").textContent = titles[tabId] || "MoneySync";
 
   renderAll();
+}
+
+// ==================== SHOP: สต็อกสินค้า + ลูกหนี้/เจ้าหนี้ ====================
+
+
+
+
+function toggleDebt(id) {
+  const d = store.debts.find(x => x.id === id);
+  if (!d) return;
+  d.paid = !d.paid; d.updatedAt = Date.now();
+  saveStore(); renderAll();
+}
+function delDebt(id) {
+  if (!confirm("ลบรายการนี้?")) return;
+  store.debts = store.debts.filter(d => d.id !== id);
+  saveStore(); renderAll();
+}
+
+// ==================== SHOP ANALYSIS (ร้านเสื้อผ้า) ====================
+// ยอดขาย = รายรับหมวด "ขายของ" | ต้นทุน = รายจ่ายหมวด "ซื้อสต็อกสินค้า" | ค่าขนส่ง = หมวด "ค่าขนส่ง/แพ็กของ"
+const SALES_CAT = CATEGORIES.income.find(c => c.includes("ขายของ"));
+const STOCK_CAT = CATEGORIES.expense.find(c => c.includes("สต็อก"));
+const SHIP_CAT = CATEGORIES.expense.find(c => c.includes("ขนส่ง"));
+const TH_MON_SHORT = ["ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.", "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค."];
+const TH_DAYS = ["อาทิตย์", "จันทร์", "อังคาร", "พุธ", "พฤหัสบดี", "ศุกร์", "เสาร์"];
+
+function shopStats(prefix) {
+  const rows = store.transactions.filter(r => r.date.startsWith(prefix));
+  const sum = a => a.reduce((s, r) => s + r.amount, 0);
+  const sales = rows.filter(r => r.type === "income" && r.category === SALES_CAT);
+  const stock = rows.filter(r => r.type === "expense" && r.category === STOCK_CAT);
+  const ship = rows.filter(r => r.type === "expense" && r.category === SHIP_CAT);
+  const S = sum(sales), C = sum(stock), F = sum(ship);
+  return { sales, stock, S, C, F, gross: S - C, net: S - C - F, orders: sales.length };
+}
+
+function topBy(rows, n = 5) {
+  const m = new Map();
+  rows.forEach(r => {
+    const k = r.title.trim().toLowerCase();
+    const o = m.get(k) || { name: r.title.trim(), amount: 0, count: 0 };
+    o.amount += r.amount; o.count++; m.set(k, o);
+  });
+  return [...m.values()].sort((a, b) => b.amount - a.amount).slice(0, n);
+}
+
+function renderShopAnalysis() {
+  const cy = new Date().getFullYear();
+  const yrs = new Set(store.transactions.map(r => r.date.slice(0, 4))); yrs.add(String(cy));
+  const yEl = $("shopYear"), mEl = $("shopMonth");
+  const firstY = !yEl.options.length, firstM = !mEl.options.length;
+  fillSelect(yEl, [...yrs].sort().map(y => `<option value="${y}">${y}</option>`).join(""));
+  fillSelect(mEl, `<option value="0">ทั้งปี</option>` + THAI_MONTHS.map((n, i) => `<option value="${i + 1}">${n}</option>`).join(""));
+  if (firstY) yEl.value = String(cy);
+  if (firstM) mEl.value = String(new Date().getMonth() + 1);
+  const year = Number(yEl.value) || cy, month = Number(mEl.value) || 0;
+
+  const prefix = month ? `${year}-${pad2(month)}` : String(year);
+  const prevPrefix = month ? (month === 1 ? `${year - 1}-12` : `${year}-${pad2(month - 1)}`) : String(year - 1);
+  const prevLabel = month ? "เดือนก่อน" : "ปีก่อน";
+  const cur = shopStats(prefix), prev = shopStats(prevPrefix);
+
+  const chg = (c, p, goodUp = true) => {
+    if (!p) return c ? '<small class="kpi-delta muted">ใหม่</small>' : "";
+    const pc = ((c - p) / Math.abs(p)) * 100;
+    return `<small class="kpi-delta ${(goodUp ? pc >= 0 : pc <= 0) ? "inc" : "exp"}">${pc >= 0 ? "▲" : "▼"} ${Math.abs(pc).toFixed(0)}% vs ${prevLabel}</small>`;
+  };
+  const margin = cur.S > 0 ? (cur.gross / cur.S) * 100 : 0;
+  const avg = cur.orders ? cur.S / cur.orders : 0;
+  const card = (label, val, extra = "", cls = "") => `<div class="card ${cls}"><span>${label}</span><strong>${val}</strong>${extra}</div>`;
+  const when = month ? `${THAI_MONTHS[month - 1]} ${year}` : `ปี ${year}`;
+  $("shopKpis").innerHTML =
+    `<div class="kpi-hero ${cur.net >= 0 ? "pos" : "neg"}"><span>กำไรสุทธิ · ${when}</span><strong>${money(cur.net)}</strong>${chg(cur.net, prev.net)}</div>` +
+    card("ยอดขาย", money(cur.S), chg(cur.S, prev.S), "income") +
+    card("ต้นทุนสินค้า (ซื้อสต็อก)", money(cur.C), chg(cur.C, prev.C, false), "expense") +
+    card("กำไรขั้นต้น", money(cur.gross), chg(cur.gross, prev.gross)) +
+    card("อัตรากำไรขั้นต้น", cur.S > 0 ? margin.toFixed(1) + "%" : "–") +
+    card("ค่าขนส่ง/แพ็กของ", money(cur.F), chg(cur.F, prev.F, false), "expense") +
+    card("บิลขาย", `${cur.orders} บิล`, cur.orders ? `<small class="kpi-delta muted">เฉลี่ย ${money(avg)}/บิล</small>` : "");
+
+  const tips = [];
+  if (cur.S > 0 && cur.C > 0) tips.push(`ทุก ฿1 ที่ซื้อสต็อก ขายได้ ฿${(cur.S / cur.C).toFixed(2)}`);
+  if (cur.C > cur.S && cur.C > 0) tips.push(`⚠️ ซื้อสต็อกมากกว่ายอดขาย ${money(cur.C - cur.S)} (อาจเป็นการเตรียมของ หรือของยังขายไม่ออก)`);
+  if (cur.net < 0) tips.push(`⚠️ ช่วงนี้ขาดทุนสุทธิ ${money(-cur.net)}`);
+  else if (cur.S > 0) tips.push(`✅ กำไรสุทธิ ${money(cur.net)} (${((cur.net / cur.S) * 100).toFixed(1)}% ของยอดขาย)`);
+  $("shopInsight").innerHTML = tips.length ? tips.map(t => `<p>${esc(t)}</p>`).join("") : '<p class="muted">ยังไม่มีรายการขาย/ซื้อสต็อกในช่วงนี้ — บันทึกรายรับหมวด "ขายของ" และรายจ่ายหมวด "ซื้อสต็อกสินค้า"</p>';
+
+  // กราฟแท่งรายเดือนของปีที่เลือก
+  const mon = Array.from({ length: 12 }, (_, i) => shopStats(`${year}-${pad2(i + 1)}`));
+  const mx = Math.max(...mon.flatMap(x => [x.S, x.C]));
+  if (!mx) $("shopChart").innerHTML = '<p class="muted">ยังไม่มีข้อมูลในปีนี้</p>';
+  else {
+    const gw = 464 / 12, base = 160, mh = 140;
+    const bars = mon.map((x, i) => {
+      const gx = 8 + i * gw, hs = (x.S / mx) * mh, hc = (x.C / mx) * mh;
+      return `${month === i + 1 ? `<rect x="${gx - 2}" y="4" width="${gw - 2}" height="172" rx="4" fill="var(--accent)" opacity="0.1"/>` : ""}
+        <rect x="${gx + 3}" y="${base - hs}" width="13" height="${hs}" rx="2" fill="#16a34a"><title>ยอดขาย ${esc(money(x.S))}</title></rect>
+        <rect x="${gx + 18}" y="${base - hc}" width="13" height="${hc}" rx="2" fill="#f59e0b"><title>ซื้อสต็อก ${esc(money(x.C))}</title></rect>
+        <text class="sh-axis" x="${gx + 17}" y="176" text-anchor="middle">${TH_MON_SHORT[i]}</text>`;
+    }).join("");
+    $("shopChart").innerHTML = `<svg viewBox="0 0 480 184" role="img" aria-label="ยอดขายเทียบต้นทุนซื้อสต็อกรายเดือน ปี ${year}"><line x1="8" x2="472" y1="160" y2="160" stroke="var(--line)"/>${bars}</svg>
+      <div class="chart-legend"><span><i style="background:#16a34a"></i>ยอดขาย</span><span><i style="background:#f59e0b"></i>ซื้อสต็อก</span></div>`;
+  }
+
+  const rank = (list, cls) => list.length ? list.map(x => `<div class="rank-row"><div class="rank-head"><span>${esc(x.name)} <small class="muted">× ${x.count}</small></span><strong>${money(x.amount)}</strong></div><div class="rank-bar ${cls}"><i style="width:${((x.amount / list[0].amount) * 100).toFixed(1)}%"></i></div></div>`).join("") : '<p class="muted">ยังไม่มีข้อมูลในช่วงนี้</p>';
+  $("shopTopSales").innerHTML = rank(topBy(cur.sales), "") + '<p class="muted-sm">จัดกลุ่มตามชื่อรายการ — ตั้งชื่อให้เหมือนกัน เช่น "เสื้อยืดคอกลม" ระบบจะรวมยอดให้</p>';
+  $("shopTopStock").innerHTML = rank(topBy(cur.stock), "stock");
+
+  const wd = Array(7).fill(0);
+  cur.sales.forEach(r => { wd[new Date(r.date + "T00:00:00").getDay()] += r.amount; });
+  const wmax = Math.max(...wd);
+  $("shopWeekday").innerHTML = wmax ? wd.map((v, i) => `<div class="rank-row"><div class="rank-head"><span>${TH_DAYS[i]}${v === wmax ? " 🏅" : ""}</span><strong>${money(v)}</strong></div><div class="rank-bar"><i style="width:${((v / wmax) * 100).toFixed(1)}%"></i></div></div>`).join("") : '<p class="muted">ยังไม่มีข้อมูลการขายในช่วงนี้</p>';
+}
+
+function renderDebts() {
+  const today = todayStr();
+  const D = [...store.debts].sort((a, b) => a.paid - b.paid || (a.due || "9999").localeCompare(b.due || "9999"));
+  const open = D.filter(d => !d.paid);
+  const sum = k => open.filter(d => d.kind === k).reduce((s, d) => s + d.amount, 0);
+  $("debtSummary").innerHTML = `<div class="annual-grid" style="grid-template-columns:1fr 1fr"><div><span>ลูกค้าค้างจ่ายเรา</span><strong class="inc">${money(sum("receivable"))}</strong></div>
+    <div><span>เราค้างจ่ายร้านส่ง</span><strong class="exp">${money(sum("payable"))}</strong></div></div>`;
+  $("debtList").innerHTML = D.length ? D.map(d => {
+    const id = esc(d.id), late = !d.paid && d.due && d.due < today;
+    return `<div class="transaction" style="${d.paid ? "opacity:.55" : ""}"><div class="tx-icon">${d.kind === "receivable" ? "🟢" : "🔴"}</div>
+      <div class="tx-info"><div class="tx-title">${esc(d.who)}${d.paid ? " ✓" : ""}</div>
+      <div class="tx-meta">${d.kind === "receivable" ? "ลูกค้าค้างจ่าย" : "ค้างจ่ายร้านส่ง"}${d.due ? ` · กำหนด ${esc(d.due)}` : ""}${late ? ' <span class="exp">เลยกำหนด</span>' : ""}${d.note ? ` · ${esc(d.note)}` : ""}</div></div>
+      <div class="tx-amount ${d.kind === "receivable" ? "income" : "expense"}">${money(d.amount)}</div>
+      <div class="tx-actions"><button data-act="debt-paid" data-id="${id}" class="icon-sm" aria-label="สลับสถานะชำระแล้ว" title="${d.paid ? "ยกเลิกชำระ" : "ชำระแล้ว"}">${d.paid ? "↩" : "✓"}</button>
+      <button data-act="debt-del" data-id="${id}" class="icon-sm delete" aria-label="ลบ">🗑️</button></div></div>`;
+  }).join("") : '<p class="muted">ไม่มีรายการค้างชำระ</p>';
+}
+
+function renderShop() {
+  store.products ||= []; store.debts ||= [];
+  if ($("shopKpis")) renderShopAnalysis();
+  if ($("debtList")) renderDebts();
 }
 
 // ==================== SMART ADD ====================
@@ -408,6 +612,8 @@ function parseSmartAdd(text) {
   if (/เงินเดือน|โบนัส/.test(title)) { type = "income"; category = "💼 เงินเดือน"; }
   else if (/ปันผล|ดอกเบี้ย|ลงทุน/.test(title)) { type = "income"; category = "📈 ดอกเบี้ย / ปันผล / ลงทุน"; }
   else if (/ขาย|รายได้/.test(title)) { type = "income"; category = "🏷️ ขายของ / รายได้เสริม"; }
+  else if (/สต็อก|สต๊อก|ของเข้า|ซื้อสินค้า|ล็อตสินค้า/.test(title)) category = "📦 ซื้อสต็อกสินค้า";
+  else if (/ค่าส่ง|ขนส่ง|แพ็ก|พัสดุ/.test(title)) category = "🚚 ค่าขนส่ง/แพ็กของ";
   else if (/ข้าว|อาหาร|กาแฟ|ชานม|ชาไข่มุก|ก๋วยเตี๋ยว|ชาบู|น้ำ|ขนม/.test(title)) category = "🍚 อาหาร";
   else if (/รถ|เดินทาง|น้ำมัน|แท็กซี่|BTS|MRT|Grab|วิน/i.test(title)) category = "🚗 เดินทาง";
   else if (/หนัง|เกม|Netflix|Spotify/i.test(title)) category = "🎬 ความบันเทิง";
@@ -429,6 +635,7 @@ function renderAll() {
   renderHistory();
   renderAnalytics();
   renderSettings();
+  renderShop();
 }
 
 function updateDropdowns() {
@@ -971,13 +1178,31 @@ document.addEventListener("DOMContentLoaded", () => {
   });
   $("pullCloudBtn").addEventListener("click", () => pullFromCloud());
   $("googleLoginBtn").addEventListener("click", googleLogin);
+  $("logoutBtn").addEventListener("click", logout);
+
+  ["shopYear", "shopMonth"].forEach(id => $(id).addEventListener("change", renderShop));
+  document.querySelectorAll("#analyticsSeg button").forEach(b => b.addEventListener("click", () => {
+    document.querySelectorAll("#analyticsSeg button").forEach(x => x.classList.toggle("active-sub", x === b));
+    $("anaYear").classList.toggle("hidden", b.dataset.view !== "year");
+    $("anaShop").classList.toggle("hidden", b.dataset.view !== "shop");
+  }));
+  $("debtForm").addEventListener("submit", e => {
+    e.preventDefault();
+    const amount = Number($("dAmount").value);
+    if (!(amount > 0) || !$("dWho").value.trim()) return;
+    store.debts.push({ id: crypto.randomUUID(), who: $("dWho").value.trim(), amount, kind: $("dKind").value === "payable" ? "payable" : "receivable",
+      due: $("dDue").value || "", note: $("dNote").value.trim(), paid: false, updatedAt: Date.now() });
+    saveStore(); renderAll(); e.target.reset();
+    showToast("เพิ่มรายการแล้ว ✓");
+  });
   $("recType").addEventListener("change", updateDropdowns);
 
   // ปุ่มในรายการ (แทน onclick inline)
   document.addEventListener("click", e => {
     const el = e.target.closest("[data-act]");
     if (!el) return;
-    const actions = { edit: editTx, del: delTx, day: selectCalDay, "del-budget": delBudget, "del-goal": delGoal, "del-rec": delRecurring, "goal-add": addGoalAmount };
+    const actions = { edit: editTx, del: delTx, day: selectCalDay, "del-budget": delBudget, "del-goal": delGoal, "del-rec": delRecurring, "goal-add": addGoalAmount,
+      "debt-paid": toggleDebt, "debt-del": delDebt };
     const fn = actions[el.dataset.act];
     if (fn) fn(el.dataset.id);
   });
@@ -1047,5 +1272,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
   if (processRecurring()) saveStore();
   renderAll();
-  initialSync();
+  updateAccountUI();
+  if (auth) auth.onAuthStateChanged(() => { updateAccountUI(); initialSync(); });
+  else setSyncStatus("🔴 ออฟไลน์ (โหลด Firebase ไม่สำเร็จ)");
 });
