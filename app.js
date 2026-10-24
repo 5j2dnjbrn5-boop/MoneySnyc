@@ -7,7 +7,7 @@ const CATEGORIES = {
     '🍚 อาหาร', '🚗 เดินทาง', '🛒 ของใช้', 
     '🎬 ความบันเทิง', '📚 การเรียน', '💳 บิล/อินเทอร์เน็ต', 
     '🛍️ ช้อปปิ้ง', '🏥 สุขภาพ/ยา',
-    '📦 ซื้อสต็อกสินค้า', '🚚 ค่าขนส่ง/แพ็กของ', '🎁 อื่น ๆ'
+    '📦 ซื้อสต็อกสินค้า', '🚚 ค่าขนส่ง/แพ็กของ', '🏪 ค่าตั้งร้าน/ค่าล็อค', '🎁 อื่น ๆ'
   ],
   income: [
     '💼 เงินเดือน', '📈 ดอกเบี้ย / ปันผล / ลงทุน', 
@@ -39,7 +39,7 @@ try {
 }
 
 let store = loadStore();
-store.products ||= []; store.debts ||= [];
+store.products ||= []; store.debts ||= []; store.shopRules ||= normShopRules();
 let deletedTxBackup = null;
 let currentCalDate = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
 let syncDebounceTimer = null;
@@ -117,6 +117,22 @@ function normalizeStore(s) {
   out.debts = arr(s.debts).filter(d => d && sid(d.id) && Number(d.amount) > 0)
     .map(d => ({ id: sid(d.id), who: String(d.who || "").slice(0, 60), amount: Number(d.amount), kind: d.kind === "payable" ? "payable" : "receivable",
       due: isDate(d.due) ? String(d.due) : "", note: String(d.note || "").slice(0, 120), paid: !!d.paid, updatedAt: Number(d.updatedAt) || Date.now() }));
+  out.shopRules = normShopRules(s.shopRules);
+  return out;
+}
+
+function normShopRules(r) {
+  const d = {
+    sales: ["ขาย"],
+    stock: ["สต็อก", "สต๊อก", "ลงของ", "ของเข้า", "ซื้อสินค้า", "ล็อตสินค้า"],
+    ship: ["ค่าส่ง", "ขนส่ง", "แพ็ก", "พัสดุ"],
+    setup: ["ตั้งร้าน", "จัดร้าน", "ค่าล็อค", "ค่าล็อก", "ค่าล้อค", "ค่าล๊อค", "ค่าเช่าร้าน", "ค่าเช่าที่"]
+  };
+  const out = {};
+  Object.keys(d).forEach(k => {
+    const src = r && Array.isArray(r[k]) ? r[k] : d[k];
+    out[k] = [...new Set(src.map(x => String(x).replace(/\s+/g, "").toLowerCase()).filter(Boolean))].slice(0, 30);
+  });
   return out;
 }
 
@@ -478,17 +494,40 @@ function delDebt(id) {
 const SALES_CAT = CATEGORIES.income.find(c => c.includes("ขายของ"));
 const STOCK_CAT = CATEGORIES.expense.find(c => c.includes("สต็อก"));
 const SHIP_CAT = CATEGORIES.expense.find(c => c.includes("ขนส่ง"));
+const SETUP_CAT = CATEGORIES.expense.find(c => c.includes("ตั้งร้าน"));
 const TH_MON_SHORT = ["ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.", "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค."];
 const TH_DAYS = ["อาทิตย์", "จันทร์", "อังคาร", "พุธ", "พฤหัสบดี", "ศุกร์", "เสาร์"];
 
+// จัดรายการเข้ากลุ่มร้านค้า: ดูหมวดหมู่ก่อน แล้วค่อยดูคำในชื่อรายการ
+function shopKind(r, rules) {
+  const t = r.title.replace(/\s+/g, "").toLowerCase();
+  const has = list => list.some(k => t.includes(k));
+  if (r.type === "income") return (r.category === SALES_CAT || has(rules.sales)) ? "sales" : null;
+  if (r.category === STOCK_CAT) return "stock";
+  if (r.category === SHIP_CAT) return "ship";
+  if (r.category === SETUP_CAT) return "setup";
+  if (has(rules.ship)) return "ship";
+  if (has(rules.setup)) return "setup";
+  if (has(rules.stock)) return "stock";
+  return null;
+}
+
 function shopStats(prefix) {
-  const rows = store.transactions.filter(r => r.date.startsWith(prefix));
+  const g = { sales: [], stock: [], ship: [], setup: [] };
+  const rules = store.shopRules || normShopRules();
+  store.transactions.forEach(r => {
+    if (!r.date.startsWith(prefix)) return;
+    const k = shopKind(r, rules);
+    if (k) g[k].push(r);
+  });
   const sum = a => a.reduce((s, r) => s + r.amount, 0);
-  const sales = rows.filter(r => r.type === "income" && r.category === SALES_CAT);
-  const stock = rows.filter(r => r.type === "expense" && r.category === STOCK_CAT);
-  const ship = rows.filter(r => r.type === "expense" && r.category === SHIP_CAT);
-  const S = sum(sales), C = sum(stock), F = sum(ship);
-  return { sales, stock, S, C, F, gross: S - C, net: S - C - F, orders: sales.length };
+  const S = sum(g.sales), C = sum(g.stock), F = sum(g.ship), T = sum(g.setup);
+  return { ...g, S, C, F, T, gross: S - C, net: S - C - F - T, orders: g.sales.length };
+}
+
+function fillRuleInputs() {
+  const r = store.shopRules;
+  [["ruleSales", "sales"], ["ruleStock", "stock"], ["ruleSetup", "setup"], ["ruleShip", "ship"]].forEach(([id, k]) => { $(id).value = r[k].join(", "); });
 }
 
 function topBy(rows, n = 5) {
@@ -529,15 +568,18 @@ function renderShopAnalysis() {
   $("shopKpis").innerHTML =
     `<div class="kpi-hero ${cur.net >= 0 ? "pos" : "neg"}"><span>กำไรสุทธิ · ${when}</span><strong>${money(cur.net)}</strong>${chg(cur.net, prev.net)}</div>` +
     card("ยอดขาย", money(cur.S), chg(cur.S, prev.S), "income") +
-    card("ต้นทุนสินค้า (ซื้อสต็อก)", money(cur.C), chg(cur.C, prev.C, false), "expense") +
+    card("ต้นทุนสินค้า (ซื้อสต็อก/ลงของ)", money(cur.C), chg(cur.C, prev.C, false), "expense") +
     card("กำไรขั้นต้น", money(cur.gross), chg(cur.gross, prev.gross)) +
     card("อัตรากำไรขั้นต้น", cur.S > 0 ? margin.toFixed(1) + "%" : "–") +
+    card("ค่าตั้งร้าน/ค่าล็อค", money(cur.T), chg(cur.T, prev.T, false), "expense") +
     card("ค่าขนส่ง/แพ็กของ", money(cur.F), chg(cur.F, prev.F, false), "expense") +
-    card("บิลขาย", `${cur.orders} บิล`, cur.orders ? `<small class="kpi-delta muted">เฉลี่ย ${money(avg)}/บิล</small>` : "");
+    card("บิลขาย", `${cur.orders} บิล`, cur.orders ? `<small class="kpi-delta muted">เฉลี่ย ${money(avg)}/บิล</small>` : "", "wide") +
+    `<p class="muted-sm kpi-caption">จับรายการได้: ขาย ${cur.sales.length} · ซื้อสต็อก ${cur.stock.length} · ค่าตั้งร้าน ${cur.setup.length} · ค่าส่ง ${cur.ship.length} รายการ (ดูจากหมวดหมู่หรือคำในชื่อรายการ)</p>`;
 
   const tips = [];
   if (cur.S > 0 && cur.C > 0) tips.push(`ทุก ฿1 ที่ซื้อสต็อก ขายได้ ฿${(cur.S / cur.C).toFixed(2)}`);
   if (cur.C > cur.S && cur.C > 0) tips.push(`⚠️ ซื้อสต็อกมากกว่ายอดขาย ${money(cur.C - cur.S)} (อาจเป็นการเตรียมของ หรือของยังขายไม่ออก)`);
+  if (cur.T > 0 && cur.S > 0) tips.push(`ค่าตั้งร้าน/ค่าล็อครวม ${money(cur.T)} (${((cur.T / cur.S) * 100).toFixed(1)}% ของยอดขาย)`);
   if (cur.net < 0) tips.push(`⚠️ ช่วงนี้ขาดทุนสุทธิ ${money(-cur.net)}`);
   else if (cur.S > 0) tips.push(`✅ กำไรสุทธิ ${money(cur.net)} (${((cur.net / cur.S) * 100).toFixed(1)}% ของยอดขาย)`);
   $("shopInsight").innerHTML = tips.length ? tips.map(t => `<p>${esc(t)}</p>`).join("") : '<p class="muted">ยังไม่มีรายการขาย/ซื้อสต็อกในช่วงนี้ — บันทึกรายรับหมวด "ขายของ" และรายจ่ายหมวด "ซื้อสต็อกสินค้า"</p>';
@@ -562,6 +604,7 @@ function renderShopAnalysis() {
   const rank = (list, cls) => list.length ? list.map(x => `<div class="rank-row"><div class="rank-head"><span>${esc(x.name)} <small class="muted">× ${x.count}</small></span><strong>${money(x.amount)}</strong></div><div class="rank-bar ${cls}"><i style="width:${((x.amount / list[0].amount) * 100).toFixed(1)}%"></i></div></div>`).join("") : '<p class="muted">ยังไม่มีข้อมูลในช่วงนี้</p>';
   $("shopTopSales").innerHTML = rank(topBy(cur.sales), "") + '<p class="muted-sm">จัดกลุ่มตามชื่อรายการ — ตั้งชื่อให้เหมือนกัน เช่น "เสื้อยืดคอกลม" ระบบจะรวมยอดให้</p>';
   $("shopTopStock").innerHTML = rank(topBy(cur.stock), "stock");
+  $("shopTopOther").innerHTML = rank(topBy([...cur.setup, ...cur.ship]), "stock");
 
   const wd = Array(7).fill(0);
   cur.sales.forEach(r => { wd[new Date(r.date + "T00:00:00").getDay()] += r.amount; });
@@ -588,7 +631,8 @@ function renderDebts() {
 }
 
 function renderShop() {
-  store.products ||= []; store.debts ||= [];
+  store.products ||= []; store.debts ||= []; store.shopRules ||= normShopRules();
+  if ($("rulesBox") && !$("rulesBox").open) fillRuleInputs();
   if ($("shopKpis")) renderShopAnalysis();
   if ($("debtList")) renderDebts();
 }
@@ -612,7 +656,8 @@ function parseSmartAdd(text) {
   if (/เงินเดือน|โบนัส/.test(title)) { type = "income"; category = "💼 เงินเดือน"; }
   else if (/ปันผล|ดอกเบี้ย|ลงทุน/.test(title)) { type = "income"; category = "📈 ดอกเบี้ย / ปันผล / ลงทุน"; }
   else if (/ขาย|รายได้/.test(title)) { type = "income"; category = "🏷️ ขายของ / รายได้เสริม"; }
-  else if (/สต็อก|สต๊อก|ของเข้า|ซื้อสินค้า|ล็อตสินค้า/.test(title)) category = "📦 ซื้อสต็อกสินค้า";
+  else if (/ตั้งร้าน|จัดร้าน|ค่าล็อ|ค่าล้อ|ค่าล๊อ|ค่าเช่าร้าน/.test(title)) category = "🏪 ค่าตั้งร้าน/ค่าล็อค";
+  else if (/สต็อก|สต๊อก|ลงของ|ของเข้า|ซื้อสินค้า|ล็อตสินค้า/.test(title)) category = "📦 ซื้อสต็อกสินค้า";
   else if (/ค่าส่ง|ขนส่ง|แพ็ก|พัสดุ/.test(title)) category = "🚚 ค่าขนส่ง/แพ็กของ";
   else if (/ข้าว|อาหาร|กาแฟ|ชานม|ชาไข่มุก|ก๋วยเตี๋ยว|ชาบู|น้ำ|ขนม/.test(title)) category = "🍚 อาหาร";
   else if (/รถ|เดินทาง|น้ำมัน|แท็กซี่|BTS|MRT|Grab|วิน/i.test(title)) category = "🚗 เดินทาง";
@@ -1186,6 +1231,15 @@ document.addEventListener("DOMContentLoaded", () => {
     $("anaYear").classList.toggle("hidden", b.dataset.view !== "year");
     $("anaShop").classList.toggle("hidden", b.dataset.view !== "shop");
   }));
+  $("rulesSaveBtn").addEventListener("click", () => {
+    const read = id => $(id).value.split(/[,，\n]/);
+    store.shopRules = normShopRules({ sales: read("ruleSales"), stock: read("ruleStock"), setup: read("ruleSetup"), ship: read("ruleShip") });
+    saveStore(); fillRuleInputs(); renderShop(); showToast("บันทึกคำค้นหาแล้ว ✓");
+  });
+  $("rulesResetBtn").addEventListener("click", () => {
+    store.shopRules = normShopRules();
+    saveStore(); fillRuleInputs(); renderShop(); showToast("คืนค่าเริ่มต้นแล้ว");
+  });
   $("debtForm").addEventListener("submit", e => {
     e.preventDefault();
     const amount = Number($("dAmount").value);
