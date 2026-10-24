@@ -159,7 +159,7 @@ function authLabel() {
 }
 function cloudDoc() {
   const u = auth && auth.currentUser;
-  return db && u ? db.collection("moneysync_users").doc(u.uid) : null;   // 1 บัญชี Google = 1 เอกสาร
+  return db && u ? db.collection("users").doc(u.uid) : null;   // 1 บัญชี Google = 1 เอกสาร
 }
 function readCloud(snap) {
   if (!snap || !snap.exists) return null;
