@@ -405,3 +405,8 @@ body { padding-bottom: calc(90px + env(safe-area-inset-bottom, 0px)); }
 .kpi-hero .kpi-delta { color: #fff; opacity: .9; }
 .card strong.inc { color: var(--green); }
 .card strong.exp { color: var(--red); }
+
+.card.wide { grid-column: 1 / -1; }
+.kpi-caption { grid-column: 1 / -1; margin: 0; }
+#rulesBox summary { cursor: pointer; padding: 2px 0; }
+.rules-form { display: grid; gap: 12px; margin-top: 12px; }
