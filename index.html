@@ -178,6 +178,11 @@
 
     <!-- Tab 4: Analytics -->
     <section id="tab-analytics" class="tab-content">
+      <div class="seg" id="analyticsSeg" role="tablist">
+        <button data-view="year" class="active-sub" role="tab">📅 รายปี</button>
+        <button data-view="shop" role="tab">👕 กำไรร้านค้า</button>
+      </div>
+      <div id="anaYear">
       <div class="panel">
         <div class="panel-head"><h2>📊 วิเคราะห์รายปี & เปรียบเทียบปี</h2></div>
         <div class="year-selector-bar">
@@ -185,6 +190,37 @@
           <label>เปรียบเทียบกับปี: <select id="compareYearSelect"></select></label>
         </div>
         <div id="comparisonReport" class="comparison-card" style="margin-top: 12px;"></div>
+      </div>
+      </div>
+      <div id="anaShop" class="hidden">
+      <div class="panel">
+        <div class="panel-head"><h2>👕 สรุปกำไร-ขาดทุนร้านค้า</h2></div>
+        <div class="year-selector-bar">
+          <label>ปี<select id="shopYear"></select></label>
+          <label>เดือน<select id="shopMonth"></select></label>
+        </div>
+        <p class="muted-sm" style="margin: 0 0 12px;">ดึงอัตโนมัติ: <b>ยอดขาย</b> จากรายรับหมวด "ขายของ" · <b>ต้นทุน</b> จากรายจ่ายหมวด "ซื้อสต็อกสินค้า" · <b>ค่าขนส่ง</b> จากหมวด "ค่าขนส่ง/แพ็กของ"</p>
+        <div id="shopKpis" class="kpi-grid"></div>
+        <div id="shopInsight" class="insights-box"></div>
+      </div>
+      <div class="panel"><div class="panel-head"><h2>📊 ยอดขาย vs ซื้อสต็อก รายเดือน</h2></div><div id="shopChart"></div></div>
+      <div class="panel"><div class="panel-head"><h2>🏆 รายการขายดี</h2></div><div id="shopTopSales"></div></div>
+      <div class="panel"><div class="panel-head"><h2>📦 ซื้อสต็อกมากสุด</h2></div><div id="shopTopStock"></div></div>
+      <div class="panel"><div class="panel-head"><h2>📅 วันไหนขายดี</h2></div><div id="shopWeekday"></div></div>
+
+      <div class="panel">
+        <div class="panel-head"><h2>🤝 ลูกหนี้ / เจ้าหนี้</h2></div>
+        <div id="debtSummary"></div>
+        <form id="debtForm" style="margin-top: 12px;">
+          <label>ชื่อลูกค้า / ร้านส่ง<input id="dWho" maxlength="60" required></label>
+          <label>ประเภท<select id="dKind"><option value="receivable">ลูกค้าค้างจ่ายเรา</option><option value="payable">เราค้างจ่ายร้านส่ง</option></select></label>
+          <label>จำนวนเงิน (บาท)<input id="dAmount" type="number" min="0.01" step="0.01" required></label>
+          <label>วันกำหนดชำระ (ไม่บังคับ)<input id="dDue" type="date"></label>
+          <label>หมายเหตุ<input id="dNote" maxlength="120"></label>
+          <button class="primary" type="submit">➕ เพิ่มรายการค้างชำระ</button>
+        </form>
+        <div id="debtList" style="margin-top: 14px;"></div>
+      </div>
       </div>
     </section>
 
