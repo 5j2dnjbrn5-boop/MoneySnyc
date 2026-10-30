@@ -26,6 +26,7 @@ const firebaseConfig = {
   measurementId: "G-BEKN1FH9GD",
   databaseURL: "https://exam-planer-pro-default-rtdb.asia-southeast1.firebasedatabase.app" 
 };
+
 let db = null;
 let auth = null;
 try {
@@ -42,16 +43,19 @@ let store = loadStore();
 store.products ||= []; store.debts ||= []; store.shopRules ||= normShopRules();
 let deletedTxBackup = null;
 let currentCalDate = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
-let syncDebounceTimer = null;
 let toastTimer = null;
 let cloudReady = false;
-let unsubscribeCloud = null;
+let unsubscribeTxList = null;
 const OWNER_KEY = "moneysync_owner";
+const LAST_SYNC_KEY = "moneysync_lastsync";
+let unsubscribeSettings = null;
+let settingsTimer = null;
+let lastSettingsSig = null;
+let viewMK = monthKey(new Date());   // เดือนที่กำลังดูในหน้าแรก
 
 const $ = id => document.getElementById(id);
 const money = n => new Intl.NumberFormat("th-TH", { style: "currency", currency: "THB" }).format(Number(n) || 0);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" }[c]));
-
 
 const THAI_MONTHS = ["มกราคม","กุมภาพันธ์","มีนาคม","เมษายน","พฤษภาคม","มิถุนายน","กรกฎาคม","สิงหาคม","กันยายน","ตุลาคม","พฤศจิกายน","ธันวาคม"];
 function pad2(n) { return String(n).padStart(2, "0"); }
@@ -59,7 +63,6 @@ function todayStr() { const d = new Date(); return `${d.getFullYear()}-${pad2(d.
 function monthKey(d) { return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}`; }
 function pctOf(a, b) { return b > 0 ? Math.min(100, Math.round((a / b) * 100)) : 0; }
 
-// คงค่าที่เลือกไว้เมื่อสร้าง <option> ใหม่
 function fillSelect(el, html) {
   if (!el) return;
   const prev = el.value;
@@ -67,7 +70,6 @@ function fillSelect(el, html) {
   if (prev && [...el.options].some(o => o.value === prev)) el.value = prev;
 }
 
-// ตรวจและทำความสะอาดข้อมูล (ใช้ตอนโหลด / ดึงจาก Cloud / นำเข้าไฟล์)
 function normalizeStore(s) {
   s = s && typeof s === "object" ? s : {};
   const arr = v => Array.isArray(v) ? v : (v && typeof v === "object" ? Object.values(v) : []);
@@ -95,7 +97,8 @@ function normalizeStore(s) {
       date: String(t.date),
       note: String(t.note || "").slice(0, 120),
       createdAt: Number(t.createdAt) || Date.now(),
-      updatedAt: Number(t.updatedAt) || Date.now()
+      updatedAt: Number(t.updatedAt) || Date.now(),
+      ...(t.weather && typeof t.weather === "object" ? { weather: { condition: String(t.weather.condition || "").slice(0, 30), precipitation: Number(t.weather.precipitation) || 0, temperature: Number(t.weather.temperature) || 0 } } : {})
     }));
 
   out.budgets = arr(s.budgets).filter(b => b && sid(b.id) && Number(b.amount) > 0)
@@ -111,13 +114,17 @@ function normalizeStore(s) {
       walletId: sid(r.walletId) || "w_bank",
       dayOfMonth: Math.min(31, Math.max(1, Number(r.dayOfMonth) || 1)),
       lastGeneratedMonth: String(r.lastGeneratedMonth || "") }));
+
   out.products = arr(s.products).filter(p => p && sid(p.id) && String(p.name || "").trim())
     .map(p => ({ id: sid(p.id), name: String(p.name).slice(0, 60), qty: Number(p.qty) || 0, cost: Math.max(0, Number(p.cost) || 0),
       price: Math.max(0, Number(p.price) || 0), min: Math.max(0, Number(p.min) || 0), updatedAt: Number(p.updatedAt) || Date.now() }));
+
   out.debts = arr(s.debts).filter(d => d && sid(d.id) && Number(d.amount) > 0)
     .map(d => ({ id: sid(d.id), who: String(d.who || "").slice(0, 60), amount: Number(d.amount), kind: d.kind === "payable" ? "payable" : "receivable",
       due: isDate(d.due) ? String(d.due) : "", note: String(d.note || "").slice(0, 120), paid: !!d.paid, updatedAt: Number(d.updatedAt) || Date.now() }));
+
   out.shopRules = normShopRules(s.shopRules);
+  out.settingsAt = Number(s.settingsAt) || 0;
   return out;
 }
 
@@ -143,7 +150,7 @@ function mergeStores(a, b) {
     products: byId(a.products || [], b.products || []), debts: byId(a.debts || [], b.debts || []) };
 }
 
-// ==================== USER ID MANAGEMENT ====================
+// ==================== FIRESTORE SUB-COLLECTIONS ARCHITECTURE ====================
 function setSyncStatus(text) {
   const el = $("syncStatusText");
   if (el) el.textContent = "สถานะ: " + text;
@@ -157,14 +164,12 @@ function authLabel() {
   const u = auth && auth.currentUser;
   return u ? (u.email || u.displayName || "ล็อกอินแล้ว") : "ยังไม่ได้ล็อกอิน";
 }
-function cloudDoc() {
+
+function userRef() {
   const u = auth && auth.currentUser;
-  return db && u ? db.collection("users").doc(u.uid) : null;   // 1 บัญชี Google = 1 เอกสาร
+  return db && u ? db.collection("users").doc(u.uid) : null;
 }
-function readCloud(snap) {
-  if (!snap || !snap.exists) return null;
-  try { return normalizeStore(JSON.parse(snap.data().json)); } catch (e) { return null; }
-}
+
 function updateAccountUI() {
   const u = auth && auth.currentUser;
   const info = $("accountInfo");
@@ -173,28 +178,69 @@ function updateAccountUI() {
   if (li) li.classList.toggle("hidden", !!u);
   if (lo) lo.classList.toggle("hidden", !u);
 }
-function mergeNewest(a, b) {
-  const by = (x, y) => {
-    const m = new Map(x.map(i => [i.id, i]));
-    y.forEach(i => { const o = m.get(i.id); if (!o || (i.updatedAt || 0) > (o.updatedAt || 0)) m.set(i.id, i); });
-    return [...m.values()];
-  };
-  return { ...a, updatedAt: Date.now(), wallets: by(a.wallets, b.wallets), transactions: by(a.transactions, b.transactions),
-    budgets: by(a.budgets, b.budgets), goals: by(a.goals, b.goals), recurring: by(a.recurring, b.recurring),
-    products: by(a.products || [], b.products || []), debts: by(a.debts || [], b.debts || []) };
+
+function stopListening() {
+  if (unsubscribeTxList) { unsubscribeTxList(); unsubscribeTxList = null; }
+  if (unsubscribeSettings) { unsubscribeSettings(); unsubscribeSettings = null; }
 }
-function stopListening() { if (unsubscribeCloud) { unsubscribeCloud(); unsubscribeCloud = null; } }
-function startListening(ref) {
+
+// เขียนขึ้น Cloud ทีละไม่เกิน 400 รายการ (Firestore batch จำกัด 500)
+async function uploadTxs(list) {
+  const ref = userRef();
+  if (!ref) return;
+  for (let i = 0; i < list.length; i += 400) {
+    const batch = db.batch();
+    list.slice(i, i + 400).forEach(tx => batch.set(ref.collection("transactions").doc(tx.id), tx));
+    await batch.commit();
+  }
+}
+
+function settingsSig() {
+  return JSON.stringify([store.shopRules, store.budgets, store.goals, store.recurring, store.debts, store.wallets]);
+}
+
+// นำการตั้งค่าจาก Cloud มาใช้ (เฉพาะฟิลด์ที่ Cloud มีจริง)
+function applySettings(d) {
+  const n = normalizeStore({ ...d, transactions: [] });
+  ["shopRules", "budgets", "goals", "recurring", "debts", "wallets"].forEach(k => { if (d[k] !== undefined) store[k] = n[k]; });
+  store.settingsAt = n.settingsAt;
+  lastSettingsSig = settingsSig();
+}
+
+// ฟังการเปลี่ยนแปลงของ Sub-collection "transactions" แบบ Realtime
+function startListeningSubCollections() {
   stopListening();
-  unsubscribeCloud = ref.onSnapshot(snap => {
-    if (snap.metadata.hasPendingWrites || !cloudReady) return;
-    const cloud = readCloud(snap);
-    if (cloud && cloud.updatedAt > (store.updatedAt || 0)) {
-      applyCloudStore(cloud);
-      setSyncStatus(`🟢 ซิงค์เรียบร้อย (${authLabel()})`);
-      showToast("อัปเดตข้อมูลจากอุปกรณ์อื่นแล้ว ✓");
-    }
+  const ref = userRef();
+  if (!ref) return;
+
+  unsubscribeTxList = ref.collection("transactions").onSnapshot(snapshot => {
+    let changed = false;
+    const changes = snapshot.docChanges();
+    const upserts = normalizeStore({ transactions: changes.filter(c => c.type !== "removed").map(c => c.doc.data()) }).transactions;
+    upserts.forEach(data => {
+      const idx = store.transactions.findIndex(t => t.id === data.id);
+      if (idx < 0) { store.transactions.push(data); changed = true; }
+      else if (JSON.stringify(store.transactions[idx]) !== JSON.stringify(data)) { store.transactions[idx] = data; changed = true; }
+    });
+    changes.filter(c => c.type === "removed").forEach(c => {
+      const before = store.transactions.length;
+      store.transactions = store.transactions.filter(t => t.id !== c.doc.id);
+      if (store.transactions.length !== before) changed = true;
+    });
+    if (changed) { localStorage.setItem(KEY_V2, JSON.stringify(store)); renderAll(); }
+    setSyncStatus(`🟢 ซิงค์เรียบร้อย (${authLabel()})`);
   }, err => console.warn("Listen error:", err));
+
+  unsubscribeSettings = ref.onSnapshot(snap => {
+    if (snap.metadata.hasPendingWrites || !snap.exists) return;
+    const d = snap.data();
+    if ((d.settingsAt || 0) > (store.settingsAt || 0)) {
+      applySettings(d);
+      localStorage.setItem(KEY_V2, JSON.stringify(store));
+      renderAll();
+      showToast("อัปเดตการตั้งค่าจากอุปกรณ์อื่นแล้ว ✓");
+    }
+  }, err => console.warn("Settings listen error:", err));
 }
 
 // ==================== DATA MIGRATION & STORAGE ====================
@@ -206,7 +252,6 @@ function loadStore() {
     try { return normalizeStore(JSON.parse(v2Raw)); } catch (e) { console.error(e); }
   }
 
-  // Safe Migration จาก Local Storage เดิม
   let legacyTx = [];
   if (v1Raw) {
     try {
@@ -237,9 +282,7 @@ function loadStore() {
       { id: "w_ewallet", name: "📱 e-Wallet", type: "ewallet" }
     ],
     transactions: legacyTx,
-    budgets: [
-      { id: "b_1", category: "🍚 อาหาร", amount: 3000 }
-    ],
+    budgets: [{ id: "b_1", category: "🍚 อาหาร", amount: 3000 }],
     goals: [],
     recurring: []
   };
@@ -248,47 +291,63 @@ function loadStore() {
   return initialStore;
 }
 
-// Save On Change + Debounce Cloud Sync (2 วิ)
-function saveStore() {
+function saveStoreLocalOnly() {
   processRecurring();
   store.updatedAt = Date.now();
   localStorage.setItem(KEY_V2, JSON.stringify(store));
-  setSyncStatus("🟡 มีการเปลี่ยนแปลง (รอซิงค์...)");
-  clearTimeout(syncDebounceTimer);
-  syncDebounceTimer = setTimeout(syncToCloud, 2000);
-}
-
-// ==================== FIREBASE CLOUD SYNC ====================
-function syncToCloud() {
-  if (!cloudReady) return Promise.resolve();
-  return pushStore();
-}
-
-function pushStore() {
-  const ref = cloudDoc();
-  if (!ref) {
-    setSyncStatus("🟡 ใช้ข้อมูลในเครื่อง (ล็อกอิน Google เพื่อซิงค์ข้ามเครื่อง)");
-    return Promise.resolve();
+  // ถ้าการตั้งค่า (งบ/เป้าหมาย/รายการประจำ/ลูกหนี้/คำค้นหา) เปลี่ยน ให้ส่งขึ้น Cloud อัตโนมัติ
+  const sig = settingsSig();
+  if (lastSettingsSig !== null && sig !== lastSettingsSig) {
+    lastSettingsSig = sig;
+    clearTimeout(settingsTimer);
+    settingsTimer = setTimeout(syncUserSettingsToCloud, 1200);
   }
-  setSyncStatus("🔄 กำลังส่งข้อมูลไปยัง Firebase...");
-  return ref.set({ json: JSON.stringify(store), updatedAt: store.updatedAt || 0, email: auth.currentUser.email || "" })
-    .then(() => setSyncStatus(`🟢 ซิงค์เรียบร้อย (${authLabel()})`))
-    .catch(err => {
-      console.warn("Cloud Sync Error:", err);
-      setSyncStatus(`🔴 ซิงค์ไม่สำเร็จ: ${cloudErr(err)}`);
-    });
 }
 
-function applyCloudStore(cloud) {
-  store = cloud;
-  localStorage.setItem(KEY_V2, JSON.stringify(store));
-  renderAll();
+// อัปเดตเฉพาะ Transaction รายเอกสารไปยัง Sub-collection
+async function saveTxToCloud(tx) {
+  const ref = userRef();
+  if (!ref) return;
+  try {
+    await ref.collection("transactions").doc(tx.id).set(tx);
+    setSyncStatus(`🟢 ซิงค์เรียบร้อย (${authLabel()})`);
+  } catch (err) {
+    console.warn("Save Tx Error:", err);
+    setSyncStatus(`🔴 ซิงค์ไม่สำเร็จ: ${cloudErr(err)}`);
+  }
 }
 
-// เปิดแอป: ล็อกอินแบบไม่ระบุตัวตน -> เทียบเวลา -> ใช้ข้อมูลที่ใหม่กว่า (ไม่เขียนทับมั่ว)
-// ทำงานเมื่อล็อกอิน/เปิดแอป: ข้อมูลผูกกับบัญชี Google (uid) ไม่ปนกันระหว่างบัญชี
+// ลบ Transaction ออกจาก Sub-collection
+async function deleteTxFromCloud(txId) {
+  const ref = userRef();
+  if (!ref) return;
+  try {
+    await ref.collection("transactions").doc(txId).delete();
+  } catch (err) {
+    console.warn("Delete Tx Error:", err);
+  }
+}
+
+// ซิงค์การตั้งค่าอื่นๆ (เช่น shopRules) ไว้ที่ Root User Document
+async function syncUserSettingsToCloud() {
+  const ref = userRef();
+  if (!ref || !cloudReady) return;
+  try {
+    store.settingsAt = Date.now();
+    localStorage.setItem(KEY_V2, JSON.stringify(store));
+    await ref.set(JSON.parse(JSON.stringify({
+      shopRules: store.shopRules, budgets: store.budgets, goals: store.goals, recurring: store.recurring,
+      debts: store.debts, wallets: store.wallets, settingsAt: store.settingsAt, updatedAt: Date.now()
+    })), { merge: true });
+    setSyncStatus(`🟢 ซิงค์เรียบร้อย (${authLabel()})`);
+  } catch (e) {
+    console.warn("Sync settings error:", e);
+    setSyncStatus(`🔴 ซิงค์ไม่สำเร็จ: ${cloudErr(e)}`);
+  }
+}
+
 async function initialSync() {
-  const ref = cloudDoc();
+  const ref = userRef();
   if (!ref) {
     cloudReady = false;
     stopListening();
@@ -296,28 +355,44 @@ async function initialSync() {
     return;
   }
   try {
-    setSyncStatus("🔄 กำลังตรวจสอบข้อมูลบน Cloud...");
+    setSyncStatus("🔄 กำลังโหลดข้อมูลจาก Cloud...");
     const uid = auth.currentUser.uid;
-    const cloud = readCloud(await ref.get());
     const owner = localStorage.getItem(OWNER_KEY);
-    if (owner && owner !== uid) { store = normalizeStore({}); }   // ข้อมูลในเครื่องเป็นของบัญชีอื่น: ไม่เอามาปนกัน
-    const hasLocal = store.transactions.length || store.budgets.length || store.goals.length || store.recurring.length;
+    const lastSync = Number(localStorage.getItem(LAST_SYNC_KEY)) || 0;
+    if (owner && owner !== uid) store = normalizeStore({});   // ข้อมูลในเครื่องเป็นของบัญชีอื่น: ไม่เอามาปนกัน
 
-    if (!cloud) {
-      // บัญชีนี้ยังไม่มีข้อมูลบน Cloud -> อัปโหลดข้อมูลในเครื่อง
-    } else if (owner === uid) {
-      if (cloud.updatedAt > (store.updatedAt || 0)) store = cloud;
-    } else if (hasLocal) {
-      store = mergeNewest(cloud, store);       // ล็อกอินครั้งแรกบนเครื่องที่มีข้อมูลอยู่แล้ว: รวมตาม id
-    } else {
-      store = cloud;
-    }
-    localStorage.setItem(OWNER_KEY, uid);
-    localStorage.setItem(KEY_V2, JSON.stringify(store));
-    renderAll();
+    const [snap, userDoc] = await Promise.all([ref.collection("transactions").get(), ref.get()]);
+    const cloudTxs = normalizeStore({ transactions: snap.docs.map(d => d.data()) }).transactions;
+
+    // รวมรายการตาม id: ของที่เพิ่มในเครื่องตอนออฟไลน์/ยังไม่เคยซิงค์ -> อัปโหลด, ของที่ถูกลบบนเครื่องอื่น -> ตัดออก
+    const cloudMap = new Map(cloudTxs.map(t => [t.id, t]));
+    const merged = new Map(cloudMap);
+    const toUpload = [];
+    store.transactions.forEach(t => {
+      const c = cloudMap.get(t.id);
+      if (!c) {
+        if (owner !== uid || (t.createdAt || 0) > lastSync) { merged.set(t.id, t); toUpload.push(t); }
+      } else if ((t.updatedAt || 0) > (c.updatedAt || 0)) { merged.set(t.id, t); toUpload.push(t); }
+    });
+    store.transactions = [...merged.values()];
+
     cloudReady = true;
-    await pushStore();
-    startListening(ref);
+    const cloudSet = userDoc.exists ? userDoc.data() : null;
+    let pushSettings = false;
+    if (cloudSet && (cloudSet.settingsAt || 0) >= (store.settingsAt || 0)) applySettings(cloudSet);
+    else pushSettings = true;
+
+    await uploadTxs(toUpload);
+    if (pushSettings) await syncUserSettingsToCloud();
+
+    localStorage.setItem(OWNER_KEY, uid);
+    localStorage.setItem(LAST_SYNC_KEY, String(Date.now()));
+    localStorage.setItem(KEY_V2, JSON.stringify(store));
+    lastSettingsSig = settingsSig();
+    if (processRecurring()) saveStoreLocalOnly();
+    renderAll();
+    setSyncStatus(`🟢 ซิงค์เรียบร้อย (${authLabel()})`);
+    startListeningSubCollections();
   } catch (err) {
     console.warn("Initial sync error:", err);
     setSyncStatus(`🔴 เชื่อมต่อ Cloud ไม่ได้: ${cloudErr(err)}`);
@@ -329,44 +404,35 @@ async function googleLogin() {
   const provider = new firebase.auth.GoogleAuthProvider();
   provider.setCustomParameters({ prompt: "select_account" });
   try {
-    await auth.signInWithPopup(provider);          // สำเร็จแล้ว onAuthStateChanged จะเรียก initialSync เอง
+    await auth.signInWithPopup(provider);
   } catch (err) {
     if (err.code === "auth/popup-blocked" || err.code === "auth/operation-not-supported-in-this-environment") {
       return auth.signInWithRedirect(provider);
     }
     if (err.code === "auth/popup-closed-by-user" || err.code === "auth/cancelled-popup-request") return;
-    alert("ล็อกอินไม่สำเร็จ: " + (err.code || err.message) +
-      (err.code === "auth/unauthorized-domain" ? "\nต้องเพิ่มโดเมนนี้ใน Firebase → Authentication → Settings → Authorized domains" : ""));
+    alert("ล็อกอินไม่สำเร็จ: " + (err.code || err.message));
   }
 }
 
 async function logout() {
   if (!auth || !auth.currentUser) return;
   if (!confirm("ออกจากระบบ? ข้อมูลในเครื่องนี้จะถูกล้าง (ข้อมูลยังอยู่บน Cloud ของบัญชีนี้)")) return;
-  try { if (cloudReady) await pushStore(); } catch (e) {}
   stopListening();
   cloudReady = false;
   await auth.signOut();
   store = normalizeStore({});
   localStorage.setItem(KEY_V2, JSON.stringify(store));
   localStorage.removeItem(OWNER_KEY);
+  localStorage.removeItem(LAST_SYNC_KEY);
   renderAll();
   updateAccountUI();
   setSyncStatus("🟡 ออกจากระบบแล้ว (ใช้ข้อมูลในเครื่อง)");
 }
 
 async function pullFromCloud() {
-  const ref = cloudDoc();
-  if (!ref) { alert("ต้องล็อกอินด้วย Google ก่อน"); return; }
-  try {
-    const cloud = readCloud(await ref.get());
-    if (!cloud) { alert("ยังไม่มีข้อมูลบน Cloud"); return; }
-    if (!confirm("นำข้อมูลจาก Cloud มาทับข้อมูลในเครื่องใช่หรือไม่?")) return;
-    applyCloudStore(cloud);
-    showToast("ดึงข้อมูลจาก Cloud สำเร็จ ✓");
-  } catch (err) {
-    alert("ดึงข้อมูลไม่สำเร็จ: " + (err.code || err.message));
-  }
+  if (!auth || !auth.currentUser) { alert("ต้องล็อกอินด้วย Google ก่อน"); return; }
+  await initialSync();
+  showToast("ดึงข้อมูลล่าสุดจาก Cloud สำเร็จ ✓");
 }
 
 // ==================== RECURRING ENGINE ====================
@@ -378,8 +444,8 @@ function processRecurring() {
   store.recurring.forEach(rec => {
     const day = Math.min(Math.max(Number(rec.dayOfMonth) || 1, 1), lastDay);
     if (rec.lastGeneratedMonth !== mk && today.getDate() >= day) {
-      store.transactions.push({
-        id: crypto.randomUUID(),
+      const newTx = {
+        id: `rec_${rec.id}_${mk}`,
         type: rec.type,
         amount: rec.amount,
         title: rec.title,
@@ -389,11 +455,13 @@ function processRecurring() {
         note: "รายการประจำอัตโนมัติ",
         createdAt: Date.now(),
         updatedAt: Date.now()
-      });
+      };
+      if (!store.transactions.some(t => t.id === newTx.id)) { store.transactions.push(newTx); saveTxToCloud(newTx); }
       rec.lastGeneratedMonth = mk;
       added = true;
     }
   });
+  if (added) syncUserSettingsToCloud();
   return added;
 }
 
@@ -403,7 +471,8 @@ window.delRecurring = function(id) {
   if (!confirm(`ยืนยันการลบรายการประจำ "${store.recurring[idx].title}"?`)) return;
 
   store.recurring.splice(idx, 1);
-  saveStore();
+  saveStoreLocalOnly();
+  syncUserSettingsToCloud();
   renderSettings();
   showToast("ลบรายการประจำแล้ว ✓");
 };
@@ -414,7 +483,8 @@ window.delBudget = function(id) {
   if (!confirm(`ยืนยันการลบงบประมาณหมวด "${store.budgets[idx].category}"?`)) return;
 
   store.budgets.splice(idx, 1);
-  saveStore();
+  saveStoreLocalOnly();
+  syncUserSettingsToCloud();
   renderSettings();
   showToast("ลบงบประมาณเรียบร้อย ✓");
 };
@@ -425,7 +495,8 @@ window.delGoal = function(id) {
   if (!confirm(`ยืนยันการลบเป้าหมาย "${store.goals[idx].title}"?`)) return;
 
   store.goals.splice(idx, 1);
-  saveStore();
+  saveStoreLocalOnly();
+  syncUserSettingsToCloud();
   renderSettings();
   showToast("ลบเป้าหมายแล้ว ✓");
 };
@@ -436,7 +507,8 @@ window.addGoalAmount = function(id) {
   const v = parseFloat(String(prompt(`เพิ่มเงินออมให้ "${g.title}" (บาท)`) || "").replace(/,/g, ""));
   if (!(v > 0)) return;
   g.currentAmount = Number(g.currentAmount) + v;
-  saveStore();
+  saveStoreLocalOnly();
+  syncUserSettingsToCloud();
   renderSettings();
   showToast("อัปเดตเป้าหมายแล้ว ✓");
 };
@@ -445,12 +517,205 @@ function resetTxForm() {
   $("txForm").reset();
   $("txId").value = "";
   $("date").value = todayStr();
-  $("formTxTitle").textContent = "➕ บันทึกรายการ";
+  $("formTxTitle").textContent = "เพิ่มรายการ";
   updateDropdowns();
 }
 
 // ==================== ROUTING & TABS ====================
+// ==================== WEATHER: Greenway Night Market, หาดใหญ่ (Open-Meteo) ====================
+const WX = { lat: 6.99723, lon: 100.48718, KEY: "moneysync_weather_v1", FRESH: 10 * 60e3, EVERY: 12 * 60e3, MAX_AGE: 6 * 3600e3,
+  data: null, ts: 0, state: "idle", inflight: null, lastTry: 0 };
+const WX_DAYS = ["อา.", "จ.", "อ.", "พ.", "พฤ.", "ศ.", "ส."];
+const WX_DIRS = ["เหนือ", "ตอ.เฉียงเหนือ", "ตะวันออก", "ตอ.เฉียงใต้", "ใต้", "ตต.เฉียงใต้", "ตะวันตก", "ตต.เฉียงเหนือ"];
+
+// แมปรหัสอากาศ WMO -> ไอคอน/คำอธิบาย (ใช้ชุดเดียวทั้งแอป)
+function wxInfo(c) {
+  const m = { 0: ["☀️", "ท้องฟ้าแจ่มใส"], 1: ["🌤️", "มีเมฆเล็กน้อย"], 2: ["⛅", "มีเมฆบางส่วน"], 3: ["☁️", "มีเมฆมาก"], 45: ["🌫️", "หมอก"], 48: ["🌫️", "หมอกน้ำแข็ง"],
+    51: ["🌦️", "ฝนปรอย"], 53: ["🌦️", "ฝนปรอย"], 55: ["🌦️", "ฝนปรอยหนา"], 56: ["🌦️", "ฝนปรอยเยือกแข็ง"], 57: ["🌦️", "ฝนปรอยเยือกแข็ง"],
+    61: ["🌧️", "ฝนเล็กน้อย"], 63: ["🌧️", "ฝนปานกลาง"], 65: ["🌧️", "ฝนหนัก"], 66: ["🌧️", "ฝนเยือกแข็ง"], 67: ["🌧️", "ฝนเยือกแข็ง"],
+    71: ["❄️", "หิมะ"], 73: ["❄️", "หิมะ"], 75: ["❄️", "หิมะ"], 77: ["❄️", "เกล็ดหิมะ"], 80: ["🌦️", "ฝนโปรยเป็นช่วง"], 81: ["🌧️", "ฝนตกเป็นช่วง"], 82: ["🌧️", "ฝนตกหนักเป็นช่วง"],
+    85: ["❄️", "หิมะโปรย"], 86: ["❄️", "หิมะตกหนัก"], 95: ["⛈️", "พายุฝนฟ้าคะนอง"], 96: ["⛈️", "พายุฝนฟ้าคะนอง มีลูกเห็บ"], 99: ["⛈️", "พายุฝนฟ้าคะนอง มีลูกเห็บ"] }[c];
+  return m ? { icon: m[0], label: m[1] } : { icon: "☁️", label: "ไม่ทราบสภาพอากาศ" };
+}
+const wxT = v => Number.isFinite(v) ? Math.round(v) + "°" : "–";
+const wxP = v => Number.isFinite(v) ? Math.round(v) + "%" : "–";
+function wxUrl() {
+  return "https://api.open-meteo.com/v1/forecast?latitude=" + WX.lat + "&longitude=" + WX.lon +
+    "&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,pressure_msl,wind_speed_10m,wind_direction_10m" +
+    "&hourly=temperature_2m,precipitation_probability,precipitation,weather_code" +
+    "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,precipitation_sum" +
+    "&timezone=Asia%2FBangkok&forecast_days=7&temperature_unit=celsius&wind_speed_unit=kmh&precipitation_unit=mm";
+}
+function wxValid(d) {
+  const arr = (o, ks) => o && ks.every(k => Array.isArray(o[k]));
+  return !!(d && d.current && Number.isFinite(d.current.temperature_2m) &&
+    arr(d.hourly, ["time", "temperature_2m", "precipitation_probability", "precipitation", "weather_code"]) &&
+    arr(d.daily, ["time", "weather_code", "temperature_2m_max", "temperature_2m_min", "precipitation_probability_max", "precipitation_sum"]));
+}
+function wxUsable() { return WX.data && Date.now() - WX.ts < WX.MAX_AGE ? WX.data : null; }
+function wxTime() { return new Date(WX.ts).toLocaleTimeString("th-TH", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Bangkok" }); }
+function wxNowHour() {   // "YYYY-MM-DDTHH" เวลาไทย ไม่ขึ้นกับเขตเวลาของเครื่อง
+  try { const s = new Date().toLocaleString("sv-SE", { timeZone: "Asia/Bangkok", hour12: false }); if (/^\d{4}-\d{2}-\d{2} \d{2}/.test(s)) return s.slice(0, 10) + "T" + s.slice(11, 13); } catch (e) {}
+  return WX.data ? String(WX.data.current.time || "").slice(0, 13) : "";
+}
+function wxHourly() {
+  const h = WX.data.hourly;
+  return h.time.map((t, i) => ({ t, hh: t.slice(11, 16), date: t.slice(0, 10), code: h.weather_code[i], temp: h.temperature_2m[i],
+    prob: Number.isFinite(h.precipitation_probability[i]) ? h.precipitation_probability[i] : null, mm: Number(h.precipitation[i]) || 0 }));
+}
+
+async function fetchWeather(force = false) {
+  if (WX.inflight) return WX.inflight;
+  if (!force && wxUsable() && Date.now() - WX.ts < WX.FRESH) return;
+  WX.lastTry = Date.now(); WX.state = "loading"; renderWeather();
+  WX.inflight = (async () => {
+    const ctl = new AbortController(), to = setTimeout(() => ctl.abort(), 10000);
+    try {
+      const res = await fetch(wxUrl(), { signal: ctl.signal });
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const d = await res.json();
+      if (!wxValid(d)) throw new Error("invalid response");
+      WX.data = d; WX.ts = Date.now(); WX.state = "ok";
+      try { localStorage.setItem(WX.KEY, JSON.stringify({ ts: WX.ts, data: d })); } catch (e) {}
+    } catch (e) { WX.state = "error"; console.warn("Weather error:", e); }
+    finally { clearTimeout(to); WX.inflight = null; renderWeather(); }
+  })();
+  return WX.inflight;
+}
+function wxManualRefresh() {
+  if (Date.now() - WX.lastTry < 30000) { showToast("เพิ่งอัปเดตเมื่อสักครู่"); return; }
+  fetchWeather(true);
+}
+function wxInit() {
+  try {
+    const c = JSON.parse(localStorage.getItem(WX.KEY) || "null");
+    if (c && wxValid(c.data) && Date.now() - c.ts < WX.MAX_AGE) { WX.data = c.data; WX.ts = c.ts; WX.state = "ok"; }
+  } catch (e) {}
+  renderWeather();
+  fetchWeather();
+  setInterval(() => { if (!document.hidden) fetchWeather(); }, WX.EVERY);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) fetchWeather(); });
+}
+
+// เงื่อนไขการขายช่วง 16:00-22:00 (กฎโปร่งใส: โอกาสฝน + ปริมาณฝน + พายุ)
+function wxSelling(hrs, nowH) {
+  const day = nowH.slice(0, 10), hr = Number(nowH.slice(11, 13));
+  let date = day, label = "วันนี้";
+  if (hr >= 22) { const d = new Date(day + "T00:00:00Z"); d.setUTCDate(d.getUTCDate() + 1); date = d.toISOString().slice(0, 10); label = "พรุ่งนี้"; }
+  const all = hrs.filter(h => h.date === date && Number(h.hh.slice(0, 2)) >= 16 && Number(h.hh.slice(0, 2)) <= 21);
+  const left = date === day ? all.filter(h => h.t.slice(0, 13) >= nowH) : all;
+  const use = left.length ? left : all;
+  if (!use.length) return { all, label, level: null };
+  const probs = use.map(h => h.prob).filter(Number.isFinite), maxP = probs.length ? Math.max(...probs) : null;
+  const sumMM = use.reduce((s, h) => s + h.mm, 0), maxMM = Math.max(...use.map(h => h.mm)), thunder = use.some(h => h.code >= 95);
+  let level = "good";
+  if ((maxP !== null && maxP >= 60) || maxMM >= 2.5 || sumMM >= 5 || thunder) level = "bad";
+  else if ((maxP !== null && maxP >= 30) || sumMM >= 1) level = "warn";
+  const risky = use.filter(h => h.prob !== null && h.prob >= 30);
+  const when = risky.length ? `${risky[0].hh}–${String((Number(risky[risky.length - 1].hh.slice(0, 2)) + 1) % 24).padStart(2, "0")}:00` : "16:00–22:00";
+  const title = { good: "เหมาะกับการออกไปขาย", warn: "ควรจับตาสภาพอากาศ", bad: "เสี่ยงฝนช่วงเวลาขาย" }[level];
+  const msg = { good: "อากาศค่อนข้างดี โอกาสฝนต่ำช่วงเวลาขาย", warn: `มีโอกาสฝนช่วง ${when} แนะนำเตรียมอุปกรณ์กันฝน`,
+    bad: `มีโอกาสฝนสูงช่วง ${when} แนะนำเตรียมผ้าใบ/อุปกรณ์กันฝน` }[level] + (thunder ? " และมีสัญญาณฝนฟ้าคะนอง ควรระวังอุปกรณ์ไฟฟ้า" : "");
+  return { all, label, level, title, msg, basis: `${label} 16:00–22:00 · โอกาสฝนสูงสุด ${wxP(maxP)} · ปริมาณฝนรวม ${sumMM.toFixed(1)} mm` };
+}
+
+function wxHourCell(h) {
+  const cls = h.prob >= 60 ? "hi" : h.prob >= 30 ? "mid" : "";
+  return `<div class="wx-h ${cls}"><span>${esc(h.hh)}</span><b>${wxInfo(h.code).icon}</b><span>${wxT(h.temp)}</span><em>${wxP(h.prob)}</em></div>`;
+}
+function wxCardHtml() {
+  const d = wxUsable();
+  if (!d) return WX.state === "error"
+    ? '<div class="wx-err"><span>ไม่สามารถอัปเดตสภาพอากาศได้</span><button type="button" class="chip" data-act="wx-refresh">ลองใหม่</button></div>'
+    : '<div class="wx-skel" aria-busy="true"></div>';
+  const hrs = wxHourly(), nowH = wxNowHour(), up = hrs.filter(h => h.t.slice(0, 13) >= nowH), c = d.current, info = wxInfo(c.weather_code), s = wxSelling(hrs, nowH);
+  const note = WX.state === "error" ? `<p class="wx-warn">ไม่สามารถอัปเดตข้อมูลอากาศได้ · ข้อมูลล่าสุดเมื่อ ${wxTime()}</p>` : "";
+  return note + `<button type="button" class="wx-main" data-act="wx-open" aria-label="ดูรายละเอียดสภาพอากาศ">
+      <span class="wx-ic">${info.icon}</span>
+      <span class="wx-temp">${Math.round(c.temperature_2m)}°C<small>${esc(info.label)}</small></span>
+      <span class="wx-stats"><span>ความชื้น ${Number.isFinite(c.relative_humidity_2m) ? Math.round(c.relative_humidity_2m) + "%" : "–"}</span><span>ลม ${Number.isFinite(c.wind_speed_10m) ? Math.round(c.wind_speed_10m) : "–"} km/h</span><span>โอกาสฝน ${up[0] ? wxP(up[0].prob) : "–"}</span></span></button>` +
+    (s.level ? `<div class="wx-cond ${s.level}"><b>${esc(s.title)}</b><span>${esc(s.msg)}</span></div>` : "") +
+    `<div class="wx-hours">${up.slice(0, 10).map(wxHourCell).join("")}</div>
+    <div class="wx-foot"><span>${WX.state === "loading" ? "กำลังอัปเดต…" : "อัปเดตล่าสุด " + wxTime()}</span><button type="button" class="link-btn" data-act="wx-open">รายละเอียด →</button></div>`;
+}
+function renderWxDetail() {
+  const box = $("wxDetail");
+  if (!box) return;
+  const head = '<div class="panel-head"><h2>Greenway · หาดใหญ่</h2><button type="button" class="icon-btn" data-act="wx-close" aria-label="ปิด">✕</button></div>';
+  const d = wxUsable();
+  if (!d) { box.innerHTML = head + wxCardHtml(); return; }
+  const hrs = wxHourly(), nowH = wxNowHour(), up = hrs.filter(h => h.t.slice(0, 13) >= nowH), c = d.current, info = wxInfo(c.weather_code), s = wxSelling(hrs, nowH), dy = d.daily;
+  const stat = (k, v) => `<div><span>${k}</span><b>${v}</b></div>`;
+  const dir = Number.isFinite(c.wind_direction_10m) ? WX_DIRS[Math.round(c.wind_direction_10m / 45) % 8] : "–";
+  const sellRows = s.all.map(h => `<div class="wx-row ${h.prob >= 60 ? "hi" : h.prob >= 30 ? "mid" : ""} ${h.t.slice(0, 13) < nowH ? "past" : ""}"><span>${esc(h.hh)}</span><span>${wxInfo(h.code).icon}</span><span>${wxT(h.temp)}</span><span>โอกาสฝน ${wxP(h.prob)}</span><em>${h.mm > 0 ? h.mm.toFixed(1) + " mm" : ""}</em></div>`).join("");
+  const days = dy.time.map((t, i) => {
+    const [yy, mm, dd] = t.split("-").map(Number), nm = i === 0 ? "วันนี้" : `${WX_DAYS[new Date(yy, mm - 1, dd).getDay()]} ${dd}`;
+    return `<div class="wx-row"><span>${nm}</span><span>${wxInfo(dy.weather_code[i]).icon}</span><span>${wxT(dy.temperature_2m_min[i])} / ${wxT(dy.temperature_2m_max[i])}</span><span>ฝน ${wxP(dy.precipitation_probability_max[i])}</span><em>${(Number(dy.precipitation_sum[i]) || 0).toFixed(1)} mm</em></div>`;
+  }).join("");
+  box.innerHTML = head + `
+    <div class="wx-cur"><span class="wx-ic">${info.icon}</span><div><b class="wx-big">${Math.round(c.temperature_2m)}°C</b><span>${esc(info.label)}</span></div></div>
+    <div class="wx-grid">${stat("รู้สึกเหมือน", wxT(c.apparent_temperature))}${stat("ความชื้น", Number.isFinite(c.relative_humidity_2m) ? Math.round(c.relative_humidity_2m) + "%" : "–")}
+      ${stat("ลม", (Number.isFinite(c.wind_speed_10m) ? Math.round(c.wind_speed_10m) : "–") + " km/h")}${stat("ทิศลม", dir)}
+      ${stat("ปริมาณฝนตอนนี้", (Number(c.precipitation) || 0).toFixed(1) + " mm")}${stat("ความกดอากาศ", Number.isFinite(c.pressure_msl) ? Math.round(c.pressure_msl) + " hPa" : "–")}</div>
+    ${s.level ? `<div class="wx-cond ${s.level}"><b>${esc(s.title)}</b><span>${esc(s.msg)}</span><small>${esc(s.basis)} · เป็นการคาดการณ์จากแบบจำลอง ไม่ใช่การยืนยัน</small></div>` : ""}
+    <h3 class="wx-h3">สภาพอากาศช่วงขาย</h3><div class="wx-rows">${sellRows || '<p class="muted">ไม่มีข้อมูลช่วง 16:00–22:00</p>'}</div>
+    <h3 class="wx-h3">24 ชั่วโมงข้างหน้า</h3><div class="wx-hours">${up.slice(0, 24).map(wxHourCell).join("")}</div>
+    <h3 class="wx-h3">วันนี้</h3><p class="muted">ต่ำสุด ${wxT(dy.temperature_2m_min[0])} · สูงสุด ${wxT(dy.temperature_2m_max[0])} · โอกาสฝนสูงสุด ${wxP(dy.precipitation_probability_max[0])} · ปริมาณฝนรวม ${(Number(dy.precipitation_sum[0]) || 0).toFixed(1)} mm</p>
+    <h3 class="wx-h3">7 วันข้างหน้า</h3><div class="wx-rows">${days}</div>
+    <div class="wx-foot"><span>${WX.state === "error" ? "อัปเดตไม่สำเร็จ · ข้อมูลล่าสุดเมื่อ " : "อัปเดตล่าสุด "}${wxTime()}</span><button type="button" class="link-btn" data-act="wx-refresh">รีเฟรช</button></div>
+    <p class="wx-attr">Weather data by <a href="https://open-meteo.com/" target="_blank" rel="noopener">Open-Meteo</a></p>`;
+}
+function renderWeather() {
+  const box = $("wxBox");
+  if (box) box.innerHTML = wxCardHtml();
+  const sh = $("wxSheet");
+  if (sh && sh.classList.contains("wx-open")) renderWxDetail();
+}
+function openWxSheet() { $("wxSheet").classList.add("wx-open"); $("sheetBackdrop").classList.add("show"); document.body.classList.add("no-scroll"); renderWxDetail(); }
+function closeWxSheet() {
+  const s = $("wxSheet");
+  if (!s || !s.classList.contains("wx-open")) return;
+  s.classList.remove("wx-open"); $("sheetBackdrop").classList.remove("show"); document.body.classList.remove("no-scroll");
+}
+
+// ==================== BOTTOM SHEET (เพิ่ม/แก้ไขรายการ) ====================
+function openAddSheet() {
+  updateDropdowns();
+  $("txDeleteBtn").classList.toggle("hidden", !$("txId").value);
+  $("tab-add").classList.add("sheet-open");
+  $("sheetBackdrop").classList.add("show");
+  document.body.classList.add("no-scroll");
+  document.querySelectorAll(".nav-item").forEach(el => el.classList.toggle("sheet-on", el.dataset.tab === "add"));
+}
+function closeAddSheet() {
+  const s = $("tab-add"), b = $("sheetBackdrop");
+  if (s) s.classList.remove("sheet-open");
+  if (b) b.classList.remove("show");
+  document.body.classList.remove("no-scroll");
+}
+
+function monthShift(mk, d) { const [y, m] = mk.split("-").map(Number); return monthKey(new Date(y, m - 1 + d, 1)); }
+function splitCat(c) { const m = String(c).match(/^([^\p{L}\p{N}]+)\s*(.*)$/u); return m ? [m[1].trim(), m[2]] : ["•", String(c)]; }
+function relDay(ds) {
+  const y = new Date(); y.setDate(y.getDate() - 1);
+  if (ds === todayStr()) return "วันนี้";
+  if (ds === `${y.getFullYear()}-${pad2(y.getMonth() + 1)}-${pad2(y.getDate())}`) return "เมื่อวาน";
+  const [, mm, dd] = ds.split("-").map(Number);
+  return `${dd} ${TH_MON_SHORT[mm - 1]}`;
+}
+function goHistory(o = {}) {
+  switchTab("history");
+  const set = (id, v) => { const el = $(id); if (el) el.value = v; };
+  set("searchKeyword", ""); set("filterType", o.type || "all"); set("filterCategory", o.category || "all"); set("filterWallet", o.wallet || "all");
+  const [y, m] = viewMK.split("-").map(Number);
+  set("filterStartDate", o.month ? `${viewMK}-01` : ""); set("filterEndDate", o.month ? `${viewMK}-${pad2(new Date(y, m, 0).getDate())}` : "");
+  renderFilteredTx();
+  window.scrollTo(0, 0);
+}
+
 function switchTab(tabId) {
+  if (tabId === "add") { openAddSheet(); return; }
+  closeAddSheet();
   document.querySelectorAll(".tab-content").forEach(el => el.classList.remove("active"));
   document.querySelectorAll(".nav-item").forEach(el => el.classList.remove("active"));
   
@@ -460,37 +725,25 @@ function switchTab(tabId) {
   const navBtn = document.querySelector(`.nav-item[data-tab="${tabId}"]`);
   if (navBtn) navBtn.classList.add("active");
 
-  const titles = {
-    dashboard: "🏠 หน้าหลัก",
-    add: "➕ บันทึกรายการ",
-    history: "📚 ประวัติการเงิน",
-    analytics: "📊 วิเคราะห์",
-    settings: "⚙️ ตั้งค่าระบบ"
-  };
+  const titles = { dashboard: "MoneySync", add: "เพิ่มรายการ", history: "ประวัติ", analytics: "วิเคราะห์", settings: "ตั้งค่า" };
   if ($("pageTitle")) $("pageTitle").textContent = titles[tabId] || "MoneySync";
 
   renderAll();
 }
 
-// ==================== SHOP: สต็อกสินค้า + ลูกหนี้/เจ้าหนี้ ====================
-
-
-
-
+// ==================== SHOP ANALYSIS & DEBTS ====================
 function toggleDebt(id) {
   const d = store.debts.find(x => x.id === id);
   if (!d) return;
   d.paid = !d.paid; d.updatedAt = Date.now();
-  saveStore(); renderAll();
+  saveStoreLocalOnly(); renderAll();
 }
 function delDebt(id) {
   if (!confirm("ลบรายการนี้?")) return;
   store.debts = store.debts.filter(d => d.id !== id);
-  saveStore(); renderAll();
+  saveStoreLocalOnly(); renderAll();
 }
 
-// ==================== SHOP ANALYSIS (ร้านเสื้อผ้า) ====================
-// ยอดขาย = รายรับหมวด "ขายของ" | ต้นทุน = รายจ่ายหมวด "ซื้อสต็อกสินค้า" | ค่าขนส่ง = หมวด "ค่าขนส่ง/แพ็กของ"
 const SALES_CAT = CATEGORIES.income.find(c => c.includes("ขายของ"));
 const STOCK_CAT = CATEGORIES.expense.find(c => c.includes("สต็อก"));
 const SHIP_CAT = CATEGORIES.expense.find(c => c.includes("ขนส่ง"));
@@ -498,7 +751,6 @@ const SETUP_CAT = CATEGORIES.expense.find(c => c.includes("ตั้งร้า
 const TH_MON_SHORT = ["ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.", "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค."];
 const TH_DAYS = ["อาทิตย์", "จันทร์", "อังคาร", "พุธ", "พฤหัสบดี", "ศุกร์", "เสาร์"];
 
-// จัดรายการเข้ากลุ่มร้านค้า: ดูหมวดหมู่ก่อน แล้วค่อยดูคำในชื่อรายการ
 function shopKind(r, rules) {
   const t = r.title.replace(/\s+/g, "").toLowerCase();
   const has = list => list.some(k => t.includes(k));
@@ -584,7 +836,6 @@ function renderShopAnalysis() {
   else if (cur.S > 0) tips.push(`✅ กำไรสุทธิ ${money(cur.net)} (${((cur.net / cur.S) * 100).toFixed(1)}% ของยอดขาย)`);
   $("shopInsight").innerHTML = tips.length ? tips.map(t => `<p>${esc(t)}</p>`).join("") : '<p class="muted">ยังไม่มีรายการขาย/ซื้อสต็อกในช่วงนี้ — บันทึกรายรับหมวด "ขายของ" และรายจ่ายหมวด "ซื้อสต็อกสินค้า"</p>';
 
-  // กราฟแท่งรายเดือนของปีที่เลือก
   const mon = Array.from({ length: 12 }, (_, i) => shopStats(`${year}-${pad2(i + 1)}`));
   const mx = Math.max(...mon.flatMap(x => [x.S, x.C]));
   if (!mx) $("shopChart").innerHTML = '<p class="muted">ยังไม่มีข้อมูลในปีนี้</p>';
@@ -699,12 +950,10 @@ function updateDropdowns() {
   fillSelect($("filterWallet"), `<option value="all">ทุกบัญชีเงิน</option>` + walletOpts);
 }
 
-
-// กราฟวงกลมสัดส่วนรายจ่ายเดือนนี้ (Donut)
 function renderDonut() {
   const box = $("donutChart");
   if (!box) return;
-  const mk = monthKey(new Date());
+  const mk = viewMK;
   const byCat = {};
   store.transactions.filter(r => r.type === "expense" && r.date.startsWith(mk))
     .forEach(r => { byCat[r.category] = (byCat[r.category] || 0) + r.amount; });
@@ -712,7 +961,7 @@ function renderDonut() {
   if (!total) { box.innerHTML = '<p class="muted">ยังไม่มีรายจ่ายในเดือนนี้</p>'; return; }
 
   const PALETTE = ["#4f46e5", "#0ea5e9", "#f59e0b", "#ec4899", "#8b5cf6", "#14b8a6"];
-  let items = Object.entries(byCat).sort((a, b) => b[1] - a[1]).map(([name, v], i) => ({ name, v, color: PALETTE[i % PALETTE.length] }));
+  let items = Object.entries(byCat).sort((a, b) => b[1] - a[1]).map(([name, v], i) => ({ name, cat: name, v, color: PALETTE[i % PALETTE.length] }));
   if (items.length > 5) {
     const rest = items.slice(5).reduce((s, x) => s + x.v, 0);
     items = items.slice(0, 5);
@@ -723,11 +972,11 @@ function renderDonut() {
   let off = 0;
   const segs = items.map(x => {
     const len = (x.v / total) * C;
-    const s = `<circle cx="90" cy="90" r="${R}" fill="none" stroke="${x.color}" stroke-width="28" stroke-dasharray="${len.toFixed(2)} ${(C - len).toFixed(2)}" stroke-dashoffset="${(-off).toFixed(2)}"/>`;
+    const s = `<circle cx="90" cy="90" r="${R}" ${x.cat ? `data-act="cat" data-id="${esc(x.cat)}" style="cursor:pointer"` : ""} fill="none" stroke="${x.color}" stroke-width="28" stroke-dasharray="${len.toFixed(2)} ${(C - len).toFixed(2)}" stroke-dashoffset="${(-off).toFixed(2)}"/>`;
     off += len;
     return s;
   }).join("");
-  const legend = items.map(x => `<li><span class="dn-dot" style="background:${x.color}"></span><span class="dn-name">${esc(x.name)}</span><span class="dn-val">${esc(money(x.v))} · ${Math.round((x.v / total) * 100)}%</span></li>`).join("");
+  const legend = items.map(x => `<li ${x.cat ? `data-act="cat" data-id="${esc(x.cat)}" role="button" tabindex="0"` : ""}><span class="dn-dot" style="background:${x.color}"></span><span class="dn-name">${esc(x.name)}</span><span class="dn-val">${esc(money(x.v))} · ${Math.round((x.v / total) * 100)}%</span></li>`).join("");
 
   box.innerHTML = `<div class="donut-wrap">
     <svg viewBox="0 0 180 180" role="img" aria-label="สัดส่วนรายจ่ายเดือนนี้ รวม ${esc(money(total))}">
@@ -739,11 +988,10 @@ function renderDonut() {
   </div>`;
 }
 
-// ผังกระแสเงินเดือนนี้ (Sankey: รายรับ -> หมวดรายจ่าย / เหลือเก็บ)
 function renderCashFlow() {
   const box = $("cashFlowChart");
   if (!box) return;
-  const mk = monthKey(new Date());
+  const mk = viewMK;
   const rows = store.transactions.filter(r => r.date.startsWith(mk));
   const inc = rows.filter(r => r.type === "income").reduce((s, r) => s + r.amount, 0);
   const byCat = {};
@@ -752,7 +1000,7 @@ function renderCashFlow() {
   if (!inc && !exp) { box.innerHTML = '<p class="muted">ยังไม่มีรายการในเดือนนี้</p>'; return; }
 
   const PALETTE = ["#4f46e5", "#0ea5e9", "#f59e0b", "#ec4899", "#8b5cf6", "#14b8a6"];
-  let items = Object.entries(byCat).sort((a, b) => b[1] - a[1]).map(([name, v], i) => ({ name, v, color: PALETTE[i % PALETTE.length] }));
+  let items = Object.entries(byCat).sort((a, b) => b[1] - a[1]).map(([name, v], i) => ({ name, cat: name, v, color: PALETTE[i % PALETTE.length] }));
   if (items.length > 5) {
     const rest = items.slice(5).reduce((s, x) => s + x.v, 0);
     items = items.slice(0, 5);
@@ -789,58 +1037,70 @@ function renderCashFlow() {
 function renderDashboard() {
   renderDonut();
   renderCashFlow();
-  const now = new Date();
-  const thisMK = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
-  
-  const curTx = store.transactions.filter(r => r.date.slice(0, 7) === thisMK);
-  const inc = curTx.filter(r => r.type === "income").reduce((a, b) => a + b.amount, 0);
-  const exp = curTx.filter(r => r.type === "expense").reduce((a, b) => a + b.amount, 0);
+  const mk = viewMK, prevMK = monthShift(mk, -1);
+  const inMonth = key => store.transactions.filter(r => r.date.startsWith(key));
+  const sum = (rows, type) => rows.filter(r => r.type === type).reduce((a, r) => a + r.amount, 0);
+  const catSum = rows => { const o = {}; rows.filter(r => r.type === "expense").forEach(r => { o[r.category] = (o[r.category] || 0) + r.amount; }); return o; };
+  const rows = inMonth(mk), prevRows = inMonth(prevMK);
+  const inc = sum(rows, "income"), exp = sum(rows, "expense"), flow = inc - exp, prevExp = sum(prevRows, "expense");
+  const bal = store.transactions.reduce((a, r) => a + (r.type === "income" ? r.amount : -r.amount), 0);
+  const [y, m] = mk.split("-").map(Number);
 
-  const totalInc = store.transactions.filter(r => r.type === "income").reduce((a, b) => a + b.amount, 0);
-  const totalExp = store.transactions.filter(r => r.type === "expense").reduce((a, b) => a + b.amount, 0);
-
-  $("totalBalance").textContent = money(totalInc - totalExp);
+  $("monthLabel").textContent = `${THAI_MONTHS[m - 1]} ${y}`;
+  $("totalBalance").textContent = money(bal);
   $("incThisMonth").textContent = money(inc);
   $("expThisMonth").textContent = money(exp);
+  const fe = $("cashFlowNet");
+  fe.textContent = (flow > 0 ? "+" : flow < 0 ? "−" : "") + money(Math.abs(flow));
+  fe.className = flow > 0 ? "inc" : flow < 0 ? "exp" : "";
 
+  // Insight จากข้อมูลจริงเท่านั้น
+  const cur = catSum(rows), prv = catSum(prevRows);
+  let st = "good", title = "การเงินเดือนนี้ปกติดี";
+  const lines = [];
+  if (!rows.length) { st = "good"; title = "ยังไม่มีรายการในเดือนนี้"; lines.push("เริ่มบันทึกรายการแรกได้จากปุ่ม + ด้านล่าง"); }
+  else if (exp > inc) { st = "bad"; title = "กำลังใช้เกินรายรับ"; lines.push(`ใช้จ่าย ${money(exp)} จากรายรับ ${money(inc)} — เกินอยู่ ${money(exp - inc)}`); }
+  else if (inc > 0 && exp > inc * 0.8) { st = "warn"; title = "ใกล้ถึงขีดรายรับ"; lines.push(`ใช้ไปแล้ว ${Math.round((exp / inc) * 100)}% ของรายรับเดือนนี้ (เหลือ ${money(inc - exp)})`); }
+  else if (inc > 0) lines.push(`เหลือเก็บ ${money(inc - exp)} (${Math.round(((inc - exp) / inc) * 100)}% ของรายรับ)`);
+  if (rows.length && prevExp > 0) lines.push(`ค่าใช้จ่ายรวม${exp >= prevExp ? "สูง" : "ต่ำ"}กว่าเดือนก่อน ${Math.abs(((exp - prevExp) / prevExp) * 100).toFixed(0)}%`);
+  const rise = Object.entries(cur).filter(([c, v]) => prv[c] > 0 && v > prv[c] * 1.1).sort((a, b) => b[1] / prv[b[0]] - a[1] / prv[a[0]])[0];
+  if (rise) lines.push(`${splitCat(rise[0])[1]} สูงกว่าเดือนก่อน ${Math.round((rise[1] / prv[rise[0]] - 1) * 100)}%`);
+  store.budgets.filter(b => (cur[b.category] || 0) > b.amount).forEach(b => lines.push(`เกินงบหมวด ${splitCat(b.category)[1]} อยู่ ${money(cur[b.category] - b.amount)}`));
+  $("dashboardInsights").innerHTML = `<div class="insight ${st}"><b>${esc(title)}</b>${lines.map(l => `<p>${esc(l)}</p>`).join("")}</div>`;
+
+  // Wallets (แตะเพื่อดูรายการของบัญชี)
   $("walletList").innerHTML = store.wallets.map(w => {
-    const wTx = store.transactions.filter(r => r.walletId === w.id);
-    const wBal = wTx.reduce((acc, r) => acc + (r.type === "income" ? r.amount : -r.amount), 0);
-    return `<div class="wallet-card">
-      <div class="wallet-name">${esc(w.name)}</div>
-      <div class="wallet-bal">${money(wBal)}</div>
-    </div>`;
+    const wb = store.transactions.filter(r => r.walletId === w.id).reduce((a, r) => a + (r.type === "income" ? r.amount : -r.amount), 0);
+    return `<button class="wallet-card" data-act="wallet" data-id="${esc(w.id)}"><span class="wallet-name">${esc(w.name)}</span><span class="wallet-bal">${money(wb)}</span></button>`;
   }).join("");
 
-  const days = now.getDate();
-  const avgDaily = exp / (days || 1);
-  const saveRate = inc > 0 ? Math.round(((inc - exp) / inc) * 100) : 0;
-  
-  $("dashboardInsights").innerHTML = `
-    <p>💡 ค่าใช้จ่ายเฉลี่ยต่อวันในเดือนนี้: <strong>${money(avgDaily)}</strong></p>
-    <p>📊 อัตราการออมเงิน (Saving Rate): <strong>${saveRate}%</strong></p>
-  `;
+  // สรุปกระแสเงินแบบกะทัดรัด (มือถือ)
+  const top = Object.entries(cur).sort((a, b) => b[1] - a[1]).slice(0, 5), scale = Math.max(inc, exp) || 1;
+  $("flowCompact").innerHTML = exp ? `<div class="flow-total"><span>รายรับ</span><b class="inc">${money(inc)}</b></div>` + top.map(([c, v]) => {
+    const [ic, n] = splitCat(c);
+    return `<div class="flow-row"><span>${esc(ic)} ${esc(n)}</span><i style="--w:${((v / scale) * 100).toFixed(1)}%"></i><em>${Math.round((v / exp) * 100)}%</em></div>`;
+  }).join("") : '<p class="muted">ยังไม่มีรายจ่ายในเดือนนี้</p>';
 
-  const recent = [...store.transactions].sort((a, b) => b.date.localeCompare(a.date) || b.createdAt - a.createdAt).slice(0, 5);
-  $("recentTxList").innerHTML = recent.length ? recent.map(txHtml).join("") : `<p class="muted">ยังไม่มีรายการบันทึก</p>`;
+  // Chips จากรายการที่บันทึกซ้ำบ่อยจริง
+  const freq = new Map();
+  store.transactions.forEach(r => { const k = `${r.title.trim()}|${r.amount}`; const o = freq.get(k) || { t: r.title.trim(), a: r.amount, c: r.category, n: 0 }; o.n++; freq.set(k, o); });
+  $("smartChips").innerHTML = [...freq.values()].filter(o => o.n >= 2).sort((a, b) => b.n - a.n).slice(0, 3)
+    .map(o => `<button type="button" class="chip" data-act="chip" data-id="${esc(o.t + " " + o.a)}">${esc(splitCat(o.c)[0])} ${esc(o.t)} ${money(o.a)}</button>`).join("");
+
+  const recent = [...rows].sort((a, b) => b.date.localeCompare(a.date) || b.createdAt - a.createdAt).slice(0, 5);
+  $("recentTxList").innerHTML = recent.length ? recent.map(txHtml).join("") : '<p class="muted">ยังไม่มีรายการในเดือนนี้</p>';
 }
 
 function txHtml(r) {
   const w = store.wallets.find(x => x.id === r.walletId);
-  const id = esc(r.id);
   const kind = r.type === "income" ? "income" : "expense";
-  return `<div class="transaction">
-    <div class="tx-icon">${kind === "income" ? "🟢" : "🔴"}</div>
-    <div class="tx-info">
-      <div class="tx-title">${esc(r.title)}</div>
-      <div class="tx-meta">${esc(r.category)} • ${esc(w ? w.name : "")} • ${esc(r.date)} ${r.note ? `(${esc(r.note)})` : ""}</div>
-    </div>
-    <div class="tx-amount ${kind}">${kind === "income" ? "+" : "−"}${money(r.amount)}</div>
-    <div class="tx-actions">
-      <button data-act="edit" data-id="${id}" class="icon-sm" title="แก้ไข" aria-label="แก้ไข">✏️</button>
-      <button data-act="del" data-id="${id}" class="icon-sm delete" title="ลบ" aria-label="ลบ">🗑️</button>
-    </div>
-  </div>`;
+  const [ic, name] = splitCat(r.category);
+  const time = r.createdAt ? new Date(r.createdAt).toLocaleTimeString("th-TH", { hour: "2-digit", minute: "2-digit" }) : "";
+  const wn = w ? splitCat(w.name)[1] || w.name : "";
+  return `<button type="button" class="tx" data-act="edit" data-id="${esc(r.id)}" aria-label="แก้ไข ${esc(r.title)}">
+    <span class="tx-ic">${esc(ic)}</span>
+    <span class="tx-main"><span class="tx-t">${esc(r.title)}</span><span class="tx-m">${esc(name)}${wn ? " · " + esc(wn) : ""}</span><span class="tx-m">${esc(relDay(r.date))}${time ? " · " + time : ""}</span></span>
+    <span class="tx-a ${kind}">${kind === "income" ? "+" : "−"}${money(r.amount)}</span></button>`;
 }
 
 window.delTx = function(id) {
@@ -848,7 +1108,8 @@ window.delTx = function(id) {
   if (idx === -1) return;
   deletedTxBackup = { item: store.transactions[idx], index: idx };
   store.transactions.splice(idx, 1);
-  saveStore();
+  saveStoreLocalOnly();
+  deleteTxFromCloud(id); // สั่งลบเฉพาะ Document ใน Cloud
   renderAll();
   showToast("ลบรายการเรียบร้อย", true);
 };
@@ -879,7 +1140,7 @@ window.editTx = function(id) {
   updateDropdowns();
   $("category").value = item.category;
 
-  $("formTxTitle").textContent = "✏️ แก้ไขรายการ";
+  $("formTxTitle").textContent = "แก้ไขรายการ";
   switchTab("add");
 };
 
@@ -898,29 +1159,29 @@ function renderHistory() {
   const yearInc = yearTx.filter(r => r.type === "income").reduce((a, b) => a + b.amount, 0);
   const yearExp = yearTx.filter(r => r.type === "expense").reduce((a, b) => a + b.amount, 0);
 
+  const yearNet = yearInc - yearExp;
+  const savingsRate = yearInc ? (yearNet / yearInc) * 100 : 0;
   $("annualOverviewCard").innerHTML = `
-    <div class="annual-grid">
-      <div><span>รายรับทั้งปี</span><strong class="inc">${money(yearInc)}</strong></div>
-      <div><span>รายจ่ายทั้งปี</span><strong class="exp">${money(yearExp)}</strong></div>
-      <div><span>เงินสุทธิ</span><strong>${money(yearInc - yearExp)}</strong></div>
+    <div class="annual-hero ${yearNet < 0 ? "negative" : ""}">
+      <span class="annual-label">เงินสุทธิ · ${esc(selectedYear)}</span>
+      <strong>${yearNet >= 0 ? "+" : "−"}${money(Math.abs(yearNet))}</strong>
+      <div class="annual-secondary"><div><span>รายรับ</span><b class="inc">+${money(yearInc)}</b></div><div><span>รายจ่าย</span><b class="exp">−${money(yearExp)}</b></div></div>
+      <small>อัตราการเก็บเงิน ${savingsRate.toFixed(1)}%</small>
     </div>
   `;
 
   const months = Array.from({ length: 12 }, (_, i) => String(i + 1).padStart(2, '0'));
+  const now = new Date(), thisMonth = monthKey(now);
   $("monthlyBreakdownList").innerHTML = months.map(m => {
     const mk = `${selectedYear}-${m}`;
     const mTx = store.transactions.filter(r => r.date.startsWith(mk));
     const mInc = mTx.filter(r => r.type === "income").reduce((a, b) => a + b.amount, 0);
     const mExp = mTx.filter(r => r.type === "expense").reduce((a, b) => a + b.amount, 0);
-
-    return `<div class="month-row">
-      <div class="month-name">${THAI_MONTHS[Number(m) - 1]} ${esc(selectedYear)}</div>
-      <div class="month-stats">
-        <span class="inc">+${money(mInc)}</span>
-        <span class="exp">−${money(mExp)}</span>
-        <strong>${money(mInc - mExp)}</strong>
-      </div>
-    </div>`;
+    const net = mInc - mExp, scale = Math.max(mInc, mExp, 1);
+    return `<button type="button" class="month-row ${mk === thisMonth ? "current-month" : ""}" data-act="history-month" data-month="${mk}">
+      <span class="month-copy"><strong>${THAI_MONTHS[Number(m) - 1]}</strong>${mk === thisMonth ? '<small>เดือนปัจจุบัน</small>' : ""}<span class="month-stats"><i class="inc">+${money(mInc)}</i><i class="exp">−${money(mExp)}</i></span><span class="month-track"><i style="width:${(mInc / scale) * 100}%"></i><b style="width:${(mExp / scale) * 100}%"></b></span></span>
+      <span class="month-net ${net < 0 ? "exp" : "inc"}">${net >= 0 ? "+" : "−"}${money(Math.abs(net))}<small>สุทธิ</small></span>
+    </button>`;
   }).join("");
 
   renderFilteredTx();
@@ -936,7 +1197,8 @@ function renderFilteredTx() {
   const end = $("filterEndDate").value;
 
   const filtered = store.transactions.filter(r => {
-    const matchSearch = [r.title, r.note, r.category].some(v => String(v || "").toLowerCase().includes(q));
+    const w = store.wallets.find(x => x.id === r.walletId);
+    const matchSearch = [r.title, r.note, r.category, w && w.name].some(v => String(v || "").toLowerCase().includes(q));
     const matchType = type === "all" || r.type === type;
     const matchCat = cat === "all" || r.category === cat;
     const matchWallet = wallet === "all" || r.walletId === wallet;
@@ -946,7 +1208,17 @@ function renderFilteredTx() {
     return matchSearch && matchType && matchCat && matchWallet && matchStart && matchEnd;
   }).sort((a, b) => b.date.localeCompare(a.date));
 
-  $("filteredTxList").innerHTML = filtered.length ? filtered.map(txHtml).join("") : `<p class="muted">ไม่พบข้อมูลตามเงื่อนไขที่เลือก</p>`;
+  const list = $("filteredTxList");
+  const visible = filtered.slice(0, 100);
+  list.innerHTML = visible.length ? visible.map(txHtml).join("") : `<p class="muted">ไม่พบข้อมูลตามเงื่อนไขที่เลือก</p>`;
+  if (filtered.length > visible.length) list.insertAdjacentHTML("beforeend", `<p class="muted history-limit">แสดง 100 จาก ${filtered.length.toLocaleString("th-TH")} รายการ · ใช้ค้นหาเพื่อจำกัดผลลัพธ์</p>`);
+  const chips = [];
+  if (type !== "all") chips.push([type === "income" ? "รายรับ" : "รายจ่าย", "filterType"]);
+  if (cat !== "all") chips.push([splitCat(cat)[1], "filterCategory"]);
+  if (wallet !== "all") chips.push([store.wallets.find(w => w.id === wallet)?.name || "บัญชี", "filterWallet"]);
+  if (start) chips.push([`ตั้งแต่ ${start}`, "filterStartDate"]);
+  if (end) chips.push([`ถึง ${end}`, "filterEndDate"]);
+  $("activeFilterChips").innerHTML = chips.map(([label, id]) => `<button class="chip" data-clear-filter="${id}">${esc(label)} ×</button>`).join("") + (chips.length ? '<button class="link-btn" data-clear-filters>ล้างทั้งหมด</button>' : "");
 }
 
 // ==================== CALENDAR ====================
@@ -1101,7 +1373,8 @@ document.addEventListener("DOMContentLoaded", () => {
     const parsed = parseSmartAdd($("smartInput").value);
     if (parsed) {
       store.transactions.push(parsed);
-      saveStore();
+      saveStoreLocalOnly();
+      saveTxToCloud(parsed); // อัปโหลดแยก Document
       $("smartInput").value = "";
       showToast("บันทึกรายการด่วนสำเร็จ ✓");
       renderAll();
@@ -1113,8 +1386,9 @@ document.addEventListener("DOMContentLoaded", () => {
   $("undoBtn").addEventListener("click", () => {
     if (deletedTxBackup) {
       store.transactions.splice(deletedTxBackup.index, 0, deletedTxBackup.item);
+      saveTxToCloud(deletedTxBackup.item);
       deletedTxBackup = null;
-      saveStore();
+      saveStoreLocalOnly();
       renderAll();
       showToast("คืนค่ารายการเรียบร้อยแล้ว ✓");
     }
@@ -1145,14 +1419,17 @@ document.addEventListener("DOMContentLoaded", () => {
       store.transactions.push(payload);
     }
 
-    saveStore();
+    saveStoreLocalOnly();
+    saveTxToCloud(payload); // อัปโหลดแยก Document
+
     e.target.reset();
     $("txId").value = "";
     if ($("date")) $("date").value = todayStr();
-    $("formTxTitle").textContent = "➕ บันทึกรายการ";
+    $("formTxTitle").textContent = "เพิ่มรายการ";
 
     showToast("บันทึกข้อมูลเรียบร้อย ✓");
-    switchTab("dashboard");
+    closeAddSheet();
+    renderAll();
   });
 
   $("budgetForm").addEventListener("submit", e => {
@@ -1165,7 +1442,8 @@ document.addEventListener("DOMContentLoaded", () => {
     if (existing) existing.amount = amt;
     else store.budgets.push({ id: crypto.randomUUID(), category: cat, amount: amt });
 
-    saveStore();
+    saveStoreLocalOnly();
+    syncUserSettingsToCloud();
     renderSettings();
     showToast("ตั้งงบประมาณเรียบร้อย ✓");
   });
@@ -1180,7 +1458,8 @@ document.addEventListener("DOMContentLoaded", () => {
       currentAmount: Number($("goalCurrent").value),
       deadline: $("goalDeadline").value
     });
-    saveStore();
+    saveStoreLocalOnly();
+    syncUserSettingsToCloud();
     e.target.reset();
     renderSettings();
     showToast("สร้างเป้าหมายเรียบร้อย ✓");
@@ -1199,7 +1478,8 @@ document.addEventListener("DOMContentLoaded", () => {
       walletId: $("recWallet").value,
       lastGeneratedMonth: ""
     });
-    saveStore();
+    saveStoreLocalOnly();
+    syncUserSettingsToCloud();
     e.target.reset();
     renderSettings();
     showToast("เพิ่มรายการประจำเรียบร้อย ✓");
@@ -1210,20 +1490,37 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   ["searchKeyword", "filterType", "filterCategory", "filterWallet", "filterStartDate", "filterEndDate"].forEach(id => {
-    if ($(id))$(id).addEventListener("input", renderFilteredTx);
+    if ($(id)) $(id).addEventListener("input", renderFilteredTx);
   });
   $("historyYearSelect").addEventListener("change", renderHistory);
+  $("historyFilterToggle")?.addEventListener("click", () => $("historyFilterFields").classList.toggle("hidden"));
+  $("historyYearPrev")?.addEventListener("click", () => { $("historyYearSelect").selectedIndex = Math.min($("historyYearSelect").selectedIndex + 1, $("historyYearSelect").options.length - 1); renderHistory(); });
+  $("historyYearNext")?.addEventListener("click", () => { $("historyYearSelect").selectedIndex = Math.max(0, $("historyYearSelect").selectedIndex - 1); renderHistory(); });
+  $("tab-history")?.addEventListener("click", e => {
+    const month = e.target.closest("[data-act='history-month']");
+    if (month) { const [y, m] = month.dataset.month.split("-"); $("filterStartDate").value = `${month.dataset.month}-01`; $("filterEndDate").value = `${month.dataset.month}-${pad2(new Date(Number(y), Number(m), 0).getDate())}`; renderFilteredTx(); $("filteredTxList").scrollIntoView({ behavior: "smooth", block: "start" }); }
+    const clear = e.target.closest("[data-clear-filter]");
+    if (clear) { $(clear.dataset.clearFilter).value = ""; if (["filterType", "filterCategory", "filterWallet"].includes(clear.dataset.clearFilter)) $(clear.dataset.clearFilter).value = "all"; renderFilteredTx(); }
+    if (e.target.closest("[data-clear-filters]")) { ["filterType", "filterCategory", "filterWallet"].forEach(id => $(id).value = "all"); ["filterStartDate", "filterEndDate", "searchKeyword"].forEach(id => $(id).value = ""); renderFilteredTx(); }
+  });
   $("analyticsYearSelect").addEventListener("change", renderAnalytics);
   $("compareYearSelect").addEventListener("change", renderAnalytics);
 
   // Sync Buttons
   $("syncNowBtn").addEventListener("click", () => {
-    if (cloudReady) pushStore().then(() => showToast("ส่งข้อมูลขึ้น Cloud แล้ว ✓"));
+    if (cloudReady) pullFromCloud();
     else initialSync();
   });
   $("pullCloudBtn").addEventListener("click", () => pullFromCloud());
   $("googleLoginBtn").addEventListener("click", googleLogin);
   $("logoutBtn").addEventListener("click", logout);
+  $("monthPrev").addEventListener("click", () => { viewMK = monthShift(viewMK, -1); renderDashboard(); });
+  $("monthNext").addEventListener("click", () => { viewMK = monthShift(viewMK, 1); renderDashboard(); });
+  $("sheetClose").addEventListener("click", closeAddSheet);
+  $("sheetBackdrop").addEventListener("click", () => { closeAddSheet(); closeWxSheet(); });
+  document.addEventListener("keydown", e => { if (e.key === "Escape") { closeAddSheet(); closeWxSheet(); } });
+  $("txDeleteBtn").addEventListener("click", () => { const id = $("txId").value; if (!id) return; closeAddSheet(); resetTxForm(); delTx(id); });
+  if (window.matchMedia && matchMedia("(min-width: 768px)").matches) $("flowDetails").open = true;
 
   ["shopYear", "shopMonth"].forEach(id => $(id).addEventListener("change", renderShop));
   document.querySelectorAll("#analyticsSeg button").forEach(b => b.addEventListener("click", () => {
@@ -1234,11 +1531,11 @@ document.addEventListener("DOMContentLoaded", () => {
   $("rulesSaveBtn").addEventListener("click", () => {
     const read = id => $(id).value.split(/[,，\n]/);
     store.shopRules = normShopRules({ sales: read("ruleSales"), stock: read("ruleStock"), setup: read("ruleSetup"), ship: read("ruleShip") });
-    saveStore(); fillRuleInputs(); renderShop(); showToast("บันทึกคำค้นหาแล้ว ✓");
+    saveStoreLocalOnly(); syncUserSettingsToCloud(); fillRuleInputs(); renderShop(); showToast("บันทึกคำค้นหาแล้ว ✓");
   });
   $("rulesResetBtn").addEventListener("click", () => {
     store.shopRules = normShopRules();
-    saveStore(); fillRuleInputs(); renderShop(); showToast("คืนค่าเริ่มต้นแล้ว");
+    saveStoreLocalOnly(); syncUserSettingsToCloud(); fillRuleInputs(); renderShop(); showToast("คืนค่าเริ่มต้นแล้ว");
   });
   $("debtForm").addEventListener("submit", e => {
     e.preventDefault();
@@ -1246,16 +1543,18 @@ document.addEventListener("DOMContentLoaded", () => {
     if (!(amount > 0) || !$("dWho").value.trim()) return;
     store.debts.push({ id: crypto.randomUUID(), who: $("dWho").value.trim(), amount, kind: $("dKind").value === "payable" ? "payable" : "receivable",
       due: $("dDue").value || "", note: $("dNote").value.trim(), paid: false, updatedAt: Date.now() });
-    saveStore(); renderAll(); e.target.reset();
+    saveStoreLocalOnly(); renderAll(); e.target.reset();
     showToast("เพิ่มรายการแล้ว ✓");
   });
   $("recType").addEventListener("change", updateDropdowns);
 
-  // ปุ่มในรายการ (แทน onclick inline)
   document.addEventListener("click", e => {
     const el = e.target.closest("[data-act]");
     if (!el) return;
-    const actions = { edit: editTx, del: delTx, day: selectCalDay, "del-budget": delBudget, "del-goal": delGoal, "del-rec": delRecurring, "goal-add": addGoalAmount,
+    const actions = { edit: editTx, del: delTx, day: selectCalDay, "del-budget": delBudget, "del-goal": delGoal, "del-rec": delRecurring,
+      "wx-open": () => openWxSheet(), "wx-close": () => closeWxSheet(), "wx-refresh": () => wxManualRefresh(),
+      cat: id => goHistory({ category: id, type: "expense", month: true }), "cat-all": () => goHistory({ type: "expense", month: true }),
+      wallet: id => goHistory({ wallet: id }), chip: v => { $("smartInput").value = v; $("smartInput").focus(); }, "goal-add": addGoalAmount,
       "debt-paid": toggleDebt, "debt-del": delDebt };
     const fn = actions[el.dataset.act];
     if (fn) fn(el.dataset.id);
@@ -1293,13 +1592,14 @@ document.addEventListener("DOMContentLoaded", () => {
     if (!file) return;
 
     const reader = new FileReader();
-    reader.onload = evt => {
+    reader.onload = async evt => {
       try {
         const imported = JSON.parse(evt.target.result);
         if (imported.transactions && Array.isArray(imported.transactions)) {
           if (confirm("ต้องการนำเข้าข้อมูล? ข้อมูลเดิมจะถูกรวมกับข้อมูลใหม่")) {
             store = mergeStores(store, normalizeStore(imported));
-            saveStore();
+            saveStoreLocalOnly();
+            if (cloudReady) await uploadTxs(store.transactions);
             renderAll();
             showToast("นำเข้าข้อมูลเรียบร้อย ✓");
           }
@@ -1324,7 +1624,9 @@ document.addEventListener("DOMContentLoaded", () => {
     $("themeBtn").textContent = isDark ? "☀️" : "☾";
   });
 
-  if (processRecurring()) saveStore();
+  wxInit();
+  lastSettingsSig = settingsSig();
+  if (processRecurring()) saveStoreLocalOnly();
   renderAll();
   updateAccountUI();
   if (auth) auth.onAuthStateChanged(() => { updateAccountUI(); initialSync(); });
